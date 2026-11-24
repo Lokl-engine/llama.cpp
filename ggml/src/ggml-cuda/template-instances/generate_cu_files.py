@@ -68,8 +68,12 @@ def get_short_name(long_quant_name):
     return long_quant_name.replace("GGML_TYPE_", "").lower()
 
 
+# fattn-mma-q4_0-instance.cu and fattn-mma-q4_1-instance.cu are written by hand (MMA kernels that read a q4 KV cache directly)
+KEEP = {"fattn-mma-q4_0-instance.cu", "fattn-mma-q4_1-instance.cu"}
+
 for filename in glob("*.cu"):
-    os.remove(filename)
+    if filename not in KEEP:
+        os.remove(filename)
 
 for head_size_kq in HEAD_SIZES_KQ:
     head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
