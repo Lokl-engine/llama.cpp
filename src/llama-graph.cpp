@@ -3137,6 +3137,16 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+// learned cache transform: a layer that carries one stores its cache through it, so the fixed Hadamard rotation is
+// not applied on top (see blk.N.attn_k_lrot and blk.N.attn_v_lrot)
+static bool llm_layer_has_lrot_k(const llama_model & model, int il) {
+    return il >= 0 && (size_t) il < model.layers.size() && model.layers[il].attn_k_lrot != nullptr;
+}
+
+static bool llm_layer_has_lrot_v(const llama_model & model, int il) {
+    return il >= 0 && (size_t) il < model.layers.size() && model.layers[il].attn_v_lrot != nullptr;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -3453,13 +3463,16 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
-    if (inp->self_k_rot[il]) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot[il]);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot[il]);
+    auto * k_rot = llm_layer_has_lrot_k(model, il) ? nullptr : inp->self_k_rot[il];
+    auto * v_rot = llm_layer_has_lrot_v(model, il) ? nullptr : inp->self_v_rot[il];
+
+    if (k_rot) {
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
     }
 
-    if (inp->self_v_rot[il]) {
-        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot[il]);
+    if (v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
     }
 
     const auto * mctx_cur = inp->mctx;
@@ -3502,8 +3515,8 @@ ggml_tensor * llm_graph_context::build_attn(
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot[il]) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
+    if (v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
 
     if (wo) {
@@ -3736,6 +3749,13 @@ static ggml_tensor * build_attn_iswa_impl(
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa[il] : inp->self_k_rot[il];
     auto * v_rot = is_swa ? inp->self_v_rot_swa[il] : inp->self_v_rot[il];
+
+    if (llm_layer_has_lrot_k(gctx.model, il)) {
+        k_rot = nullptr;
+    }
+    if (llm_layer_has_lrot_v(gctx.model, il)) {
+        v_rot = nullptr;
+    }
 
     if (k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
