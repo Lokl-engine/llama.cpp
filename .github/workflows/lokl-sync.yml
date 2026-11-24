@@ -1,9 +1,13 @@
 # Lokl fork: follow upstream automatically.
 #
 # The `lokl` branch is an upstream build tag plus a short stack of our commits (the learned KV-cache transform and this
-# file). Every day this job mirrors upstream's master, re-applies our commits on upstream's newest build tag, builds
-# the result, and, if that works, moves `lokl` there and tags it `<upstream tag>-lokl.1`. If our commits no longer
-# apply or no longer build, nothing moves and an issue is opened.
+# file). Every day this job re-applies our commits on upstream's newest build tag, builds the result, and, if that
+# works, moves `lokl` there and tags it `<upstream tag>-lokl.1`. If our commits no longer apply or no longer build,
+# or the push is refused, nothing moves and an issue is opened. The fork's `master` is not kept current: `lokl` is
+# the branch that follows upstream.
+#
+# Upstream's own workflows are switched off in this fork (a repository setting); the last step switches off any that
+# a new upstream file brings in.
 #
 # The build check is CPU only and loads no model. Before a tag is pinned by lokl-inference or the app it is checked on
 # real models (a model file without learned tensors must behave exactly as upstream). The tag lokl-inference pins
@@ -18,6 +22,7 @@ on:
 permissions:
   contents: write
   issues: write
+  actions: write
 
 concurrency:
   group: lokl-sync
@@ -34,11 +39,6 @@ jobs:
         with:
           ref: lokl
           fetch-depth: 0
-
-      - name: Mirror upstream master
-        run: |
-          gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=master \
-            || echo "::warning::the master mirror was not updated"
 
       - name: Find upstream's newest build tag
         id: up
@@ -75,10 +75,20 @@ jobs:
         if: steps.up.outputs.todo == 'yes'
         run: |
           new="${{ steps.up.outputs.tag }}-lokl.1"
+          if git ls-remote --exit-code --tags origin "refs/tags/$new" > /dev/null; then
+            echo "$new exists already: our commits changed since it was made, so tag this one by hand"; exit 1
+          fi
           git tag "$new"
           git push --force-with-lease origin HEAD:lokl
           git push origin "$new"
           echo "lokl is now $new"
+
+      - name: Keep upstream's workflows switched off
+        if: always()
+        run: |
+          gh api "repos/${{ github.repository }}/actions/workflows?per_page=100" \
+            -q '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/")) and .path != ".github/workflows/lokl-sync.yml") | .id' \
+            | while read -r id; do gh api -X PUT "repos/${{ github.repository }}/actions/workflows/$id/disable" && echo "switched off $id"; done
 
       - name: Open an issue on failure
         if: failure()
