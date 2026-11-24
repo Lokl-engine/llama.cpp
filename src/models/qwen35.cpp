@@ -75,6 +75,21 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
             // Q/K normalization for attention layers
             layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
             layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
+            // learned cache transform (optional)
+            {
+                const int64_t nkv = n_embd_k_gqa / n_embd_head_k;
+                const int64_t hd  = n_embd_head_k;
+                layer.attn_k_lrot     = create_tensor(tn(LLM_TENSOR_ATTN_K_LROT,     "weight", il), { hd, hd },     TENSOR_NOT_REQUIRED);
+                layer.attn_k_lrot_s   = create_tensor(tn(LLM_TENSOR_ATTN_K_LROT_S,   "weight", il), { hd, nkv },    TENSOR_NOT_REQUIRED);
+                layer.attn_k_lrot_mu  = create_tensor(tn(LLM_TENSOR_ATTN_K_LROT_MU,  "weight", il), { hd, nkv },    TENSOR_NOT_REQUIRED);
+                layer.attn_q_lrot_s   = create_tensor(tn(LLM_TENSOR_ATTN_Q_LROT_S,   "weight", il), { hd, n_head }, TENSOR_NOT_REQUIRED);
+                layer.attn_v_lrot     = create_tensor(tn(LLM_TENSOR_ATTN_V_LROT,     "weight", il), { hd, hd },     TENSOR_NOT_REQUIRED);
+                layer.attn_v_lrot_inv = create_tensor(tn(LLM_TENSOR_ATTN_V_LROT_INV, "weight", il), { hd, hd },     TENSOR_NOT_REQUIRED);
+                layer.attn_v_lrot_s   = create_tensor(tn(LLM_TENSOR_ATTN_V_LROT_S,   "weight", il), { hd, nkv },    TENSOR_NOT_REQUIRED);
+                layer.attn_v_lrot_mu  = create_tensor(tn(LLM_TENSOR_ATTN_V_LROT_MU,  "weight", il), { hd, nkv },    TENSOR_NOT_REQUIRED);
+                layer.attn_o_lrot_s   = create_tensor(tn(LLM_TENSOR_ATTN_O_LROT_S,   "weight", il), { hd, n_head }, TENSOR_NOT_REQUIRED);
+                layer.attn_o_lrot_mu  = create_tensor(tn(LLM_TENSOR_ATTN_O_LROT_MU,  "weight", il), { hd, n_head }, TENSOR_NOT_REQUIRED);
+            }
         } else {
             // Linear attention (gated delta net) specific tensors
             // Create tensors with calculated dimensions
@@ -330,6 +345,22 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     Qcur = build_rope(Qcur, inp_pos, il);
     Kcur = build_rope(Kcur, inp_pos, il);
 
+    // learned cache transform: k' = ((k - mu) * s) R, q' = (q / s) R, v' = ((v - mu) * s) R
+    const auto & lr = model.layers[il];
+    if (lr.attn_k_lrot) {
+        Kcur = ggml_mul(ctx0, ggml_sub(ctx0, Kcur, lr.attn_k_lrot_mu), lr.attn_k_lrot_s);
+        Kcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_k_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Kcur), n_embd_head, n_head_kv * n_tokens)),
+                               n_embd_head, n_head_kv, n_tokens);
+        Qcur = ggml_mul(ctx0, Qcur, lr.attn_q_lrot_s);
+        Qcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_k_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Qcur), n_embd_head, n_head * n_tokens)),
+                               n_embd_head, n_head, n_tokens);
+    }
+    if (lr.attn_v_lrot) {
+        Vcur = ggml_mul(ctx0, ggml_sub(ctx0, Vcur, lr.attn_v_lrot_mu), lr.attn_v_lrot_s);
+        Vcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_v_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Vcur), n_embd_head, n_head_kv * n_tokens)),
+                               n_embd_head, n_head_kv, n_tokens);
+    }
+
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
@@ -341,6 +372,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_pregate", il);
+    if (lr.attn_v_lrot) {  // o = (o' R^T) / s + mu, per query head, before the output gate
+        cur = ggml_mul_mat(ctx0, lr.attn_v_lrot_inv, ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur), n_embd_head, n_head * n_tokens));
+        cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_reshape_3d(ctx0, cur, n_embd_head, n_head, n_tokens), lr.attn_o_lrot_s), lr.attn_o_lrot_mu);
+        cur = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tokens);
+    }
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
