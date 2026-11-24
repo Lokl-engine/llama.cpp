@@ -93,6 +93,21 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
 
         layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head}, 0);
         layer.attn_k_norm    = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM,    "weight", i), {n_embd_head}, kv_flags);
+        // learned cache transform (optional)
+        if (hparams.has_kv(i)) {
+            const int64_t nkv = n_embd_k / n_embd_head;
+            const int64_t hd  = n_embd_head;
+            layer.attn_k_lrot     = create_tensor(tn(LLM_TENSOR_ATTN_K_LROT,     "weight", i), { hd, hd },     TENSOR_NOT_REQUIRED);
+            layer.attn_k_lrot_s   = create_tensor(tn(LLM_TENSOR_ATTN_K_LROT_S,   "weight", i), { hd, nkv },    TENSOR_NOT_REQUIRED);
+            layer.attn_k_lrot_mu  = create_tensor(tn(LLM_TENSOR_ATTN_K_LROT_MU,  "weight", i), { hd, nkv },    TENSOR_NOT_REQUIRED);
+            layer.attn_q_lrot_s   = create_tensor(tn(LLM_TENSOR_ATTN_Q_LROT_S,   "weight", i), { hd, n_head }, TENSOR_NOT_REQUIRED);
+            layer.attn_v_lrot     = create_tensor(tn(LLM_TENSOR_ATTN_V_LROT,     "weight", i), { hd, hd },     TENSOR_NOT_REQUIRED);
+            layer.attn_v_lrot_inv = create_tensor(tn(LLM_TENSOR_ATTN_V_LROT_INV, "weight", i), { hd, hd },     TENSOR_NOT_REQUIRED);
+            layer.attn_v_lrot_s   = create_tensor(tn(LLM_TENSOR_ATTN_V_LROT_S,   "weight", i), { hd, nkv },    TENSOR_NOT_REQUIRED);
+            layer.attn_v_lrot_mu  = create_tensor(tn(LLM_TENSOR_ATTN_V_LROT_MU,  "weight", i), { hd, nkv },    TENSOR_NOT_REQUIRED);
+            layer.attn_o_lrot_s   = create_tensor(tn(LLM_TENSOR_ATTN_O_LROT_S,   "weight", i), { hd, n_head }, TENSOR_NOT_REQUIRED);
+            layer.attn_o_lrot_mu  = create_tensor(tn(LLM_TENSOR_ATTN_O_LROT_MU,  "weight", i), { hd, n_head }, TENSOR_NOT_REQUIRED);
+        }
         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
 
         layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), {1u}, TENSOR_NOT_REQUIRED);
@@ -339,9 +354,32 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
 
             cb(Kcur, "Kcur_pos", il);
 
+            const auto & lr = model.layers[il];
+            if (lr.attn_k_lrot) {  // learned cache transform
+                Kcur = ggml_mul(ctx0, ggml_sub(ctx0, Kcur, lr.attn_k_lrot_mu), lr.attn_k_lrot_s);
+                Kcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_k_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Kcur), n_embd_head, n_head_kv * n_tokens)),
+                                       n_embd_head, n_head_kv, n_tokens);
+                Qcur = ggml_mul(ctx0, Qcur, lr.attn_q_lrot_s);
+                Qcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_k_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Qcur), n_embd_head, n_head * n_tokens)),
+                                       n_embd_head, n_head, n_tokens);
+            }
+            if (lr.attn_v_lrot) {
+                Vcur = ggml_mul(ctx0, ggml_sub(ctx0, Vcur, lr.attn_v_lrot_mu), lr.attn_v_lrot_s);
+                Vcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_v_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Vcur), n_embd_head, n_head_kv * n_tokens)),
+                                       n_embd_head, n_head_kv, n_tokens);
+                cur = build_attn(inp_attn, nullptr,
+                        nullptr, nullptr, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
+                        hparams.f_attention_scale, il);
+                // o = (o' R^T) / s + mu per query head, then the output projection
+                cur = ggml_mul_mat(ctx0, lr.attn_v_lrot_inv, ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur), n_embd_head, n_head * n_tokens));
+                cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_reshape_3d(ctx0, cur, n_embd_head, n_head, n_tokens), lr.attn_o_lrot_s), lr.attn_o_lrot_mu);
+                cur = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tokens);
+                cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+            } else {
             cur = build_attn(inp_attn, model.layers[il].wo,
                     nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     hparams.f_attention_scale, il);
+            }
         } else {
             // reuse KV cache of earlier layers
             cur = build_attn(inp_attn,

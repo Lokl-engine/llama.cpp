@@ -289,6 +289,16 @@ struct llama_layer {
     struct ggml_tensor * attn_q_norm_b   = nullptr;
     struct ggml_tensor * attn_k_norm     = nullptr;
     struct ggml_tensor * attn_k_norm_b   = nullptr;
+    struct ggml_tensor * attn_k_lrot = nullptr;
+    struct ggml_tensor * attn_k_lrot_s = nullptr;
+    struct ggml_tensor * attn_k_lrot_mu = nullptr;
+    struct ggml_tensor * attn_q_lrot_s = nullptr;
+    struct ggml_tensor * attn_v_lrot = nullptr;
+    struct ggml_tensor * attn_v_lrot_inv = nullptr;
+    struct ggml_tensor * attn_v_lrot_s = nullptr;
+    struct ggml_tensor * attn_v_lrot_mu = nullptr;
+    struct ggml_tensor * attn_o_lrot_s = nullptr;
+    struct ggml_tensor * attn_o_lrot_mu = nullptr;
     struct ggml_tensor * attn_out_norm   = nullptr;
     struct ggml_tensor * attn_out_norm_b = nullptr;
     struct ggml_tensor * attn_q_a_norm   = nullptr;
