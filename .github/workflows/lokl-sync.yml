@@ -1,0 +1,89 @@
+# Lokl fork: follow upstream automatically.
+#
+# The `lokl` branch is an upstream build tag plus a short stack of our commits (the learned KV-cache transform and this
+# file). Every day this job mirrors upstream's master, re-applies our commits on upstream's newest build tag, builds
+# the result, and, if that works, moves `lokl` there and tags it `<upstream tag>-lokl.1`. If our commits no longer
+# apply or no longer build, nothing moves and an issue is opened.
+#
+# The build check is CPU only and loads no model. Before a tag is pinned by lokl-inference or the app it is checked on
+# real models (a model file without learned tensors must behave exactly as upstream).
+name: lokl sync with upstream
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: lokl-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Lokl-engine/llama.cpp'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: lokl
+          fetch-depth: 0
+
+      - name: Mirror upstream master
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=master \
+            || echo "::warning::the master mirror was not updated"
+
+      - name: Find upstream's newest build tag
+        id: up
+        run: |
+          git remote add upstream https://github.com/ggml-org/llama.cpp.git
+          git fetch -q upstream master
+          git fetch -q upstream 'refs/tags/b*:refs/tags/b*'
+          tag=$(git tag --list 'b[0-9]*' --merged upstream/master --sort=-v:refname | grep -E '^b[0-9]+$' | head -1)
+          base=$(git merge-base HEAD upstream/master)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "newest upstream tag: $tag; lokl sits on $(git describe --tags --match 'b[0-9]*' "$base")"
+          if [ "$(git rev-parse "$tag^{commit}")" = "$base" ]; then
+            echo "todo=no" >> "$GITHUB_OUTPUT"; echo "already on $tag"
+          else
+            echo "todo=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Re-apply our commits on it
+        if: steps.up.outputs.todo == 'yes'
+        run: |
+          git config user.name "lokl-sync"
+          git config user.email "lokl-sync@users.noreply.github.com"
+          git rebase --onto "${{ steps.up.outputs.tag }}" "${{ steps.up.outputs.base }}" lokl
+
+      - name: Build (CPU)
+        if: steps.up.outputs.todo == 'yes'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+          cmake --build build -j "$(nproc)" --target llama llama-perplexity
+
+      - name: Move lokl and tag it
+        if: steps.up.outputs.todo == 'yes'
+        run: |
+          new="${{ steps.up.outputs.tag }}-lokl.1"
+          git tag "$new"
+          git push --force-with-lease origin HEAD:lokl
+          git push origin "$new"
+          echo "lokl is now $new"
+
+      - name: Open an issue on failure
+        if: failure()
+        run: |
+          title="lokl sync failed on ${{ steps.up.outputs.tag }}"
+          if [ -z "$(gh issue list -R "${{ github.repository }}" --state open --search "lokl sync failed in:title" --json number -q '.[].number')" ]; then
+            gh issue create -R "${{ github.repository }}" --title "$title" \
+              --body "Our commits did not apply or build on upstream's newest tag: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
