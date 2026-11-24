@@ -6,7 +6,8 @@
 # apply or no longer build, nothing moves and an issue is opened.
 #
 # The build check is CPU only and loads no model. Before a tag is pinned by lokl-inference or the app it is checked on
-# real models (a model file without learned tensors must behave exactly as upstream).
+# real models (a model file without learned tensors must behave exactly as upstream). The tag lokl-inference pins
+# does not move when this job runs.
 name: lokl sync with upstream
 
 on:
