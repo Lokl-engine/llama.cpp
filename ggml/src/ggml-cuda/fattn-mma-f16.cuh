@@ -5,6 +5,15 @@
 
 using namespace ggml_cuda_mma;
 
+// The type of the K/V data this translation unit reads. The default is f16 (other types are converted to f16 before
+// the kernel runs, see launch_fattn). A template-instance file that defines GGML_CUDA_FATTN_MMA_KV_TYPE as
+// GGML_TYPE_Q4_0 or GGML_TYPE_Q4_1 before it includes this header gets kernels that read the 4-bit blocks of a
+// quantized KV cache directly and dequantize them while a tile is loaded, so nothing is converted per call.
+#ifndef GGML_CUDA_FATTN_MMA_KV_TYPE
+#define GGML_CUDA_FATTN_MMA_KV_TYPE GGML_TYPE_F16
+#endif // GGML_CUDA_FATTN_MMA_KV_TYPE
+static constexpr bool ggml_cuda_fattn_mma_kv_f16 = GGML_CUDA_FATTN_MMA_KV_TYPE == GGML_TYPE_F16;
+
 // Config options for the MMA kernel.
 // Should not affect results, only speed/register pressure/shared memory use.
 struct fattn_mma_config {
@@ -396,11 +405,17 @@ static constexpr __device__ bool ggml_cuda_fattn_mma_get_swizzled(const int DKQ,
 // ------------------------------------------------------------------------------------------------------------------
 
 static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
+    if (!ggml_cuda_fattn_mma_kv_f16) {
+        return 0; // quantized K/V is dequantized while loading, which cp_async cannot do
+    }
     return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
 }
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
         const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_sparse) {
+    if (!ggml_cuda_fattn_mma_kv_f16) {
+        return 0; // see the host version
+    }
 #ifdef CP_ASYNC_AVAILABLE
     const int nstages_target = ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
     // sparse gather is not implemented for multi-stage loading
@@ -413,9 +428,49 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
 
 // ------------------------------------------------------------------------------------------------------------------
 
+// 8 consecutive elements [e0, e0 + 8) of a row of q4_0 / q4_1 blocks as 4 half2, e0 a multiple of 8.
+// The arithmetic is that of dequantize_q4_0 / dequantize_q4_1 followed by the cast to half,
+// so the values are the ones that the conversion of the whole K/V tensor to f16 produces.
+static __device__ __forceinline__ void flash_attn_ext_q4_load_chunk(const char * const __restrict__ row, const int e0, half2 * const __restrict__ vals) {
+    const int ib    = e0 / 32;          // block within the row
+    const int off   = e0 % 32;          // 0, 8, 16 or 24: elements 0-15 are the low nibbles, 16-31 the high nibbles
+    const int shift = off < 16 ? 0 : 4;
+    const uint16_t * qs16;              // 2 quant bytes per load, blocks are 2-byte aligned
+    float d;
+    float m;
+    if constexpr (GGML_CUDA_FATTN_MMA_KV_TYPE == GGML_TYPE_Q4_1) {
+        const block_q4_1 * const b = (const block_q4_1 *) row + ib;
+        const float2 dm = __half22float2(b->dm);
+        d = dm.x;
+        m = dm.y;
+        qs16 = (const uint16_t *) (b->qs + off % 16);
+    } else {
+        const block_q4_0 * const b = (const block_q4_0 *) row + ib;
+        d = __half2float(b->d);
+        m = -8.0f;
+        qs16 = (const uint16_t *) (b->qs + off % 16);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q = qs16[j];
+        float x0 = (q >>  shift     ) & 0xF;
+        float x1 = (q >> (shift + 8)) & 0xF;
+        if constexpr (GGML_CUDA_FATTN_MMA_KV_TYPE == GGML_TYPE_Q4_1) {
+            x0 = (x0 * d) + m;
+            x1 = (x1 * d) + m;
+        } else {
+            x0 = (x0 + m) * d;
+            x1 = (x1 + m) * d;
+        }
+        vals[j] = make_half2(__float2half(x0), __float2half(x1));
+    }
+}
+
+// KV points to the start of the rows, the tile holds the D2 half2 values of each row that start at h2_0.
+// For quantized K/V (GGML_CUDA_FATTN_MMA_KV_TYPE) the rows are blocks, stride_KV is still their size in units of half2.
 template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
-        const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV,
+        const half2 * const __restrict__ KV, const int h2_0, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV,
         const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     // K/V data is loaded with decreasing granularity for D for better memory bandwidth.
@@ -426,6 +481,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     if constexpr (use_cp_async) {
         static_assert(warp_size == 32, "bad warp_size");
         static_assert(!oob_check || use_sparse, "OOB check not compatible with cp_async");
+        static_assert(!use_cp_async || ggml_cuda_fattn_mma_kv_f16, "quantized K/V cannot be loaded with cp_async");
         constexpr int preload = 64;
 
         const unsigned int tile_KV_32 = ggml_cuda_cvta_generic_to_shared(tile_KV);
@@ -464,7 +520,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
-                    cp_async_cg_16<preload>(tile_KV_32 + swizzle<stride_tile*sizeof(half2), char>(i*stride_tile*sizeof(half2) + k*chunk_size, i), KV + i_KV*stride_KV + k*h2_per_chunk);
+                    cp_async_cg_16<preload>(tile_KV_32 + swizzle<stride_tile*sizeof(half2), char>(i*stride_tile*sizeof(half2) + k*chunk_size, i), KV + h2_0 + i_KV*stride_KV + k*h2_per_chunk);
                 }
             }
         };
@@ -499,13 +555,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
+                    if constexpr (!ggml_cuda_fattn_mma_kv_f16) {
+                        static_assert(!use_sparse, "sparse gather not implemented for quantized K/V");
+                        // a chunk is 8 consecutive elements of one block: h2_0 is a multiple of nbatch_K2 / nbatch_V2
+                        __align__(16) half2 vals[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
+                        if (!oob_check || i < i_sup) {
+                            const int64_t i_KV = indices ? max(indices[k_VKQ_0 + i], 0) : k_VKQ_0 + i;
+                            flash_attn_ext_q4_load_chunk((const char *) KV + i_KV*stride_KV*int64_t(sizeof(half2)), 2*(h2_0 + k*h2_per_chunk), vals);
+                        }
+                        ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + k*h2_per_chunk, i), vals);
+                        continue;
+                    }
                     const half2 * src;
                     if constexpr (use_sparse) {
                         const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
-                        src = index >= 0 ? KV + int64_t(index)*stride_KV + k*h2_per_chunk : zero;
+                        src = index >= 0 ? KV + h2_0 + int64_t(index)*stride_KV + k*h2_per_chunk : zero;
                     } else if (!oob_check || i < i_sup) {
                         const int64_t i_KV = indices ? max(indices[k_VKQ_0 + i], 0) : k_VKQ_0 + i;
-                        src = KV + i_KV*stride_KV + k*h2_per_chunk;
+                        src = KV + h2_0 + i_KV*stride_KV + k*h2_per_chunk;
                     } else {
                         src = zero;
                     }
@@ -677,7 +744,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         cp_async_wait_all();
         __syncthreads();
         flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (V_h2, tile_V, min(nbatch_V2, DV/2), stride_V, k_VKQ_0, k_VKQ_sup, indices);
+            (V_h2, 0, tile_V, min(nbatch_V2, DV/2), stride_V, k_VKQ_0, k_VKQ_sup, indices);
     } else {
         // the sparse mask values are gathered per element, always load them synchronously
         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
@@ -697,7 +764,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int k0_diff = min(k0_stop, DKQ/2) - k0_start; // Only load the real head size from global memory.
             constexpr bool use_cp_async = nstages == 1;
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
+                (K_h2, k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
             if (use_cp_async) {
                 cp_async_wait_all();
             }
@@ -1034,7 +1101,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     (mask_h, tile_mask, stride_mask, kb0_next*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
             }
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2, tile_K, min(nbatch_K2, DKQ/2), stride_K, kb0_next*nbatch_fa, k_VKQ_sup, indices);
+                (K_h2, 0, tile_K, min(nbatch_K2, DKQ/2), stride_K, kb0_next*nbatch_fa, k_VKQ_sup, indices);
         }
     }
 
@@ -1050,7 +1117,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
                 flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
+                    (V_h2, i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
                 if (use_cp_async) {
                     cp_async_wait_all();
                 }
@@ -1460,7 +1527,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
         }
         flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (K_h2, tile_K, min(nbatch_K2, DKQ/2), stride_K, kb0*nbatch_fa, k_VKQ_sup, indices);
+            (K_h2, 0, tile_K, min(nbatch_K2, DKQ/2), stride_K, kb0*nbatch_fa, k_VKQ_sup, indices);
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
@@ -2220,7 +2287,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
 #if !defined(GGML_USE_MUSA)
-        if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
+        if constexpr (ggml_cuda_fattn_mma_kv_f16 && ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
             if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2)) {
                 constexpr bool use_sparse_kernel = true;
                 fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
@@ -2267,7 +2334,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     const bool async_kv_preload = nstages == 2 && !use_sparse;
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, warp_size_host, async_kv_preload);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, ggml_cuda_fattn_mma_kv_f16, ggml_cuda_fattn_mma_kv_f16, true, use_sparse, warp_size_host, async_kv_preload);
 }
 
 
