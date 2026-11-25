@@ -365,6 +365,10 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // optional: a GGUF file holding the learned KV-cache transform of this model (see --kv-transform), loaded
+        // beside the model file; NULL when the model file carries its own or none is used
+        const char * kv_transform;
     };
 
     struct llama_sampler_seq_config {

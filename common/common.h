@@ -315,6 +315,8 @@ struct common_params_model {
 
     std::vector<std::string> shards;
 
+    std::string kv_transform = ""; // GGUF with the learned KV-cache transform of this model (--kv-transform)
+
     std::vector<std::string> get_paths() const {
         std::vector<std::string> paths = { path };
         for (const auto & shard : shards) {
