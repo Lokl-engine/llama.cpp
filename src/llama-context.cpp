@@ -4475,6 +4475,34 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    // A q4_0 or q4_1 attention cache is served only through the cache transform learned for that format (a rotation,
+    // a scale and a centre per layer, carried by the model file or given with --kv-transform). The fixed rotation
+    // alone loses more, so it is refused unless LLAMA_KV_Q4_FIXED_ROTATION=1 asks for it (measurements).
+    {
+        const auto is_q4 = [](ggml_type t) { return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1; };
+        const char * env_fixed = getenv("LLAMA_KV_Q4_FIXED_ROTATION");
+        bool has_kv = false;
+        for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
+            has_kv = has_kv || model->hparams.has_kv(il);
+        }
+        if (has_kv && (is_q4(params.type_k) || is_q4(params.type_v)) && !(env_fixed != nullptr && atoi(env_fixed) != 0)) {
+            const auto it = model->gguf_kv.find("lokl.kv_transform");
+            const std::string have = it == model->gguf_kv.end() ? "" : it->second;
+            const std::string want = std::string("learned ") + ggml_type_name(params.type_k) + " learned+scale+centre";
+            const bool same  = params.type_k == params.type_v;
+            const bool match = same && (have == want || have.rfind(want + " ", 0) == 0);
+            if (!match) {
+                LLAMA_LOG_ERROR("%s: a %s / %s attention cache is refused: %s. A 4-bit cache needs the cache transform learned for "
+                        "that format (keys and values alike), in the model file or given with --kv-transform; this model %s. "
+                        "q8_0 and f16 work with any model file\n", __func__,
+                        ggml_type_name(params.type_k), ggml_type_name(params.type_v),
+                        !same ? "keys and values must use the same 4-bit format" : "the transform for it is missing",
+                        have.empty() ? "carries none" : ("carries \"" + have + "\"").c_str());
+                return nullptr;
+            }
+        }
+    }
+
     const bool fp8_cache = params.type_k == GGML_TYPE_F8_E4M3 || params.type_v == GGML_TYPE_F8_E4M3;
     // Direct cache consumers do not use the shared attention scaling helpers.
     if (fp8_cache && (model->hparams.is_mla() ||
