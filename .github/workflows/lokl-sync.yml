@@ -7,7 +7,7 @@
 # the branch that follows upstream.
 #
 # Upstream's own workflows are switched off in this fork (a repository setting); the last step switches off any that
-# a new upstream file brings in.
+# a new upstream file brings in. The fork's own workflows are the files named lokl-*.yml.
 #
 # The build check is CPU only and loads no model. Before a tag is pinned by lokl-inference or the app it is checked on
 # real models (a model file without learned tensors must behave exactly as upstream). The tag lokl-inference pins
@@ -87,7 +87,7 @@ jobs:
         if: always()
         run: |
           gh api "repos/${{ github.repository }}/actions/workflows?per_page=100" \
-            -q '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/")) and .path != ".github/workflows/lokl-sync.yml") | .id' \
+            -q '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/")) and (.path | startswith(".github/workflows/lokl-") | not)) | .id' \
             | while read -r id; do gh api -X PUT "repos/${{ github.repository }}/actions/workflows/$id/disable" && echo "switched off $id"; done
 
       - name: Open an issue on failure
