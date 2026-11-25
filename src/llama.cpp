@@ -312,10 +312,87 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     return true;
 }
 
+// Check a learned KV-cache transform given as a side file against the model file it is for, and return what it
+// declares ("learned <format> learned+scale+centre ..."). The side file holds only the transform's tensors; it is
+// then loaded as an extra GGUF beside the model file.
+static std::string llama_kv_transform_check(const std::string & fname_side, const std::string & fname_model) {
+    static const char * const key_what = "lokl.kv_transform";
+    static const char * const key_size = "lokl.kv_transform.base_size";
+    static const char * const key_arch = "general.architecture";
+
+    struct gguf_init_params probe = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ nullptr,
+    };
+    gguf_context_ptr side { gguf_init_from_file(fname_side.c_str(), probe) };
+    if (!side) {
+        throw std::runtime_error(format("failed to read the KV-cache transform file %s", fname_side.c_str()));
+    }
+    const auto str = [](const gguf_context * ctx, const char * key) -> std::string {
+        const int64_t kid = gguf_find_key(ctx, key);
+        return kid >= 0 && gguf_get_kv_type(ctx, kid) == GGUF_TYPE_STRING ? gguf_get_val_str(ctx, kid) : "";
+    };
+    const std::string what = str(side.get(), key_what);
+    if (what.rfind("learned ", 0) != 0) {
+        throw std::runtime_error(format("%s is not a KV-cache transform file (no learned %s)", fname_side.c_str(), key_what));
+    }
+    const int64_t n_tensors = gguf_get_n_tensors(side.get());
+    if (n_tensors == 0) {
+        throw std::runtime_error(format("the KV-cache transform file %s holds no tensors", fname_side.c_str()));
+    }
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const std::string name = gguf_get_tensor_name(side.get(), i);
+        if (name.rfind("blk.", 0) != 0 || name.find(".attn_") == std::string::npos || name.find("_lrot") == std::string::npos) {
+            throw std::runtime_error(format("the KV-cache transform file %s holds tensor '%s', which is not part of a transform",
+                fname_side.c_str(), name.c_str()));
+        }
+    }
+
+    gguf_context_ptr base { gguf_init_from_file(fname_model.c_str(), probe) };
+    if (!base) {
+        throw std::runtime_error(format("failed to read %s", fname_model.c_str()));
+    }
+    if (gguf_find_key(base.get(), key_what) >= 0) {
+        throw std::runtime_error(format("%s already carries a KV-cache transform (\"%s\"); do not give it another with --kv-transform",
+            fname_model.c_str(), str(base.get(), key_what).c_str()));
+    }
+    if (str(side.get(), key_arch) != str(base.get(), key_arch)) {
+        throw std::runtime_error(format("the KV-cache transform file %s is for architecture '%s', the model is '%s'",
+            fname_side.c_str(), str(side.get(), key_arch).c_str(), str(base.get(), key_arch).c_str()));
+    }
+    const int64_t kid_size = gguf_find_key(side.get(), key_size);
+    if (kid_size < 0 || gguf_get_kv_type(side.get(), kid_size) != GGUF_TYPE_UINT64) {
+        throw std::runtime_error(format("the KV-cache transform file %s does not say which model file it is for (%s)",
+            fname_side.c_str(), key_size));
+    }
+    const uint64_t want_size = gguf_get_val_u64(side.get(), kid_size);
+    const uint64_t have_size = llama_file(fname_model.c_str(), "rb").size();
+    if (want_size != have_size) {
+        throw std::runtime_error(format("the KV-cache transform file %s is for a model file of %" PRIu64 " bytes; %s has %" PRIu64,
+            fname_side.c_str(), want_size, fname_model.c_str(), have_size));
+    }
+    return what;
+}
+
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
+        // a learned KV-cache transform given as a side file: checked against the model file, then loaded as an
+        // extra GGUF beside it
+        std::string kv_transform;
+        if (params.kv_transform != nullptr && params.kv_transform[0] != '\0') {
+            if (fname.empty()) {
+                throw std::runtime_error("a KV-cache transform file needs a model given by path");
+            }
+            kv_transform = llama_kv_transform_check(params.kv_transform, fname);
+            if (splits.empty()) {
+                splits.push_back(fname);
+            }
+            splits.push_back(params.kv_transform);
+            LLAMA_LOG_INFO("%s: KV-cache transform from %s: %s\n", __func__, params.kv_transform, kv_transform.c_str());
+        }
+
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
@@ -350,6 +427,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
+        }
+        if (!kv_transform.empty()) {
+            // what the side file declares reads as the model's own metadata (llama_model_meta_val_str)
+            model->gguf_kv["lokl.kv_transform"] = kv_transform;
         }
         try {
             model->load_vocab(ml);
