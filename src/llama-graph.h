@@ -1090,6 +1090,12 @@ struct llm_graph_context {
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
+
+    // whether layer il stores its keys / values through its learned cache transform (it carries one and its own
+    // cache is 4-bit)
+    bool lrot_k(int il) const;
+    bool lrot_v(int il) const;
+
     const llama_ubatch  & ubatch;
 
     const llama_prec_policy & prec_policy;

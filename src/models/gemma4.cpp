@@ -355,7 +355,7 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
             cb(Kcur, "Kcur_pos", il);
 
             const auto & lr = model.layers[il];
-            if (lr.attn_k_lrot) {  // learned cache transform
+            if (lrot_k(il)) {  // learned cache transform
                 Kcur = ggml_mul(ctx0, ggml_sub(ctx0, Kcur, lr.attn_k_lrot_mu), lr.attn_k_lrot_s);
                 Kcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_k_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Kcur), n_embd_head, n_head_kv * n_tokens)),
                                        n_embd_head, n_head_kv, n_tokens);
@@ -363,7 +363,7 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
                 Qcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_k_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Qcur), n_embd_head, n_head * n_tokens)),
                                        n_embd_head, n_head, n_tokens);
             }
-            if (lr.attn_v_lrot) {
+            if (lrot_v(il)) {
                 Vcur = ggml_mul(ctx0, ggml_sub(ctx0, Vcur, lr.attn_v_lrot_mu), lr.attn_v_lrot_s);
                 Vcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_v_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Vcur), n_embd_head, n_head_kv * n_tokens)),
                                        n_embd_head, n_head_kv, n_tokens);

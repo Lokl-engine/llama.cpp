@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -367,6 +368,9 @@ llama_context::llama_context(
 
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
+    cparams.type_k         = params.type_k;
+    cparams.type_v         = params.type_v;
+    cparams.type_swa       = params.type_swa;
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
@@ -539,7 +543,9 @@ llama_context::llama_context(
             /*.no_alloc  =*/ model.no_alloc(),
         };
 
+        llama_kv_cache_iswa_type_swa = params.type_swa;
         memory.reset(model.create_memory(params_mem, cparams));
+        llama_kv_cache_iswa_type_swa = GGML_TYPE_COUNT;
     }
 
     // init backends
@@ -4428,6 +4434,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.type_swa                    =*/ GGML_TYPE_COUNT,
     };
 
     return result;
@@ -4478,24 +4485,41 @@ llama_context * llama_init_from_model(
     // A q4_0 or q4_1 attention cache is served only through the cache transform learned for that format (a rotation,
     // a scale and a centre per layer, carried by the model file or given with --kv-transform). The fixed rotation
     // alone loses more, so it is refused unless LLAMA_KV_Q4_FIXED_ROTATION=1 asks for it (measurements).
+    // Sliding-window layers may have a cache type of their own (type_swa); the rule holds for each cache.
     {
         const auto is_q4 = [](ggml_type t) { return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1; };
         const char * env_fixed = getenv("LLAMA_KV_Q4_FIXED_ROTATION");
-        bool has_kv = false;
+        bool has_base = false;
+        bool has_swa  = false;
         for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
-            has_kv = has_kv || model->hparams.has_kv(il);
+            if (model->hparams.has_kv(il)) {
+                (model->hparams.is_swa(il) ? has_swa : has_base) = true;
+            }
         }
-        if (has_kv && (is_q4(params.type_k) || is_q4(params.type_v)) && !(env_fixed != nullptr && atoi(env_fixed) != 0)) {
+        const bool own_swa = has_swa && params.type_swa != GGML_TYPE_COUNT;
+        if (params.type_swa != GGML_TYPE_COUNT && !has_swa) {
+            LLAMA_LOG_WARN("%s: the model has no sliding-window layers; the cache type given for them (%s) is not used\n",
+                    __func__, ggml_type_name(params.type_swa));
+        }
+        struct kv_types { const char * what; bool used; ggml_type k; ggml_type v; };
+        const kv_types caches[2] = {
+            { own_swa ? "attention cache of the other layers" : "attention cache", own_swa ? has_base : (has_base || has_swa), params.type_k, params.type_v },
+            { "attention cache of the sliding-window layers", own_swa, params.type_swa, params.type_swa },
+        };
+        for (const auto & c : caches) {
+            if (!c.used || !(is_q4(c.k) || is_q4(c.v)) || (env_fixed != nullptr && atoi(env_fixed) != 0)) {
+                continue;
+            }
             const auto it = model->gguf_kv.find("lokl.kv_transform");
             const std::string have = it == model->gguf_kv.end() ? "" : it->second;
-            const std::string want = std::string("learned ") + ggml_type_name(params.type_k) + " learned+scale+centre";
-            const bool same  = params.type_k == params.type_v;
+            const std::string want = std::string("learned ") + ggml_type_name(c.k) + " learned+scale+centre";
+            const bool same  = c.k == c.v;
             const bool match = same && (have == want || have.rfind(want + " ", 0) == 0);
             if (!match) {
-                LLAMA_LOG_ERROR("%s: a %s / %s attention cache is refused: %s. A 4-bit cache needs the cache transform learned for "
+                LLAMA_LOG_ERROR("%s: a %s / %s %s is refused: %s. A 4-bit cache needs the cache transform learned for "
                         "that format (keys and values alike), in the model file or given with --kv-transform; this model %s. "
                         "q8_0 and f16 work with any model file\n", __func__,
-                        ggml_type_name(params.type_k), ggml_type_name(params.type_v),
+                        ggml_type_name(c.k), ggml_type_name(c.v), c.what,
                         !same ? "keys and values must use the same 4-bit format" : "the transform for it is missing",
                         have.empty() ? "carries none" : ("carries \"" + have + "\"").c_str());
                 return nullptr;

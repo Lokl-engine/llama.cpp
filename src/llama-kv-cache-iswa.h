@@ -11,6 +11,10 @@
 // utilizes two instances of llama_kv_cache
 //   the first instance is for the non-SWA layers of the model and the second instance is for the SWA layers
 
+// the cache type of the sliding-window layers for the next llama_kv_cache_iswa built on this thread
+// (llama_context_params::type_swa); GGML_TYPE_COUNT = the same as the other layers
+extern thread_local ggml_type llama_kv_cache_iswa_type_swa;
+
 class llama_kv_cache_iswa : public llama_memory_i {
 public:
     llama_kv_cache_iswa(

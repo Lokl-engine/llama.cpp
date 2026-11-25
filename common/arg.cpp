@@ -2444,6 +2444,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--cache-type-swa"}, "TYPE",
+        string_format(
+            "KV cache data type (K and V) of the sliding-window layers of a model that has them\n"
+            "allowed values: %s\n"
+            "(default: the same as --cache-type-k / --cache-type-v)",
+            get_all_kv_cache_types().c_str()
+        ),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_swa = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_SWA"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

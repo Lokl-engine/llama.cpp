@@ -11,6 +11,8 @@
 // llama_kv_cache_iswa
 //
 
+thread_local ggml_type llama_kv_cache_iswa_type_swa = GGML_TYPE_COUNT;
+
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
                      bool   no_alloc,
@@ -97,10 +99,15 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             v_trans, offload, unified, size_base, n_seq_max,
             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
 
-    LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
+    const bool own_type = llama_kv_cache_iswa_type_swa != GGML_TYPE_COUNT;
+    const ggml_type type_k_swa = own_type ? llama_kv_cache_iswa_type_swa : type_k;
+    const ggml_type type_v_swa = own_type ? llama_kv_cache_iswa_type_swa : type_v;
+
+    LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells, K (%s), V (%s)\n", __func__, size_swa,
+            ggml_type_name(type_k_swa), ggml_type_name(type_v_swa));
 
     kv_swa = std::make_unique<llama_kv_cache>(
-            model, no_alloc, hparams, type_k, type_v,
+            model, no_alloc, hparams, type_k_swa, type_v_swa,
             v_trans, offload, unified, size_swa, n_seq_max,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
 }

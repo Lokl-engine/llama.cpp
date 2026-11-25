@@ -54,6 +54,11 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
     bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
 
+    // attention-cache types, for the graph: a layer's learned cache transform is applied only when its own cache is 4-bit
+    ggml_type type_k   = GGML_TYPE_F16;
+    ggml_type type_v   = GGML_TYPE_F16;
+    ggml_type type_swa = GGML_TYPE_COUNT; // sliding-window layers; GGML_TYPE_COUNT = as type_k / type_v
+
     size_t moe_cache_size;
     float  moe_cache_cpu_share;
 
