@@ -1,0 +1,68 @@
+# Lokl fork: build a tag's macOS arm64 tools in CI and attach them to a release on this fork.
+#
+# Started by hand with a tag of this fork (for example b12651-lokl.1). The build uses the settings of upstream's own
+# release job for macOS arm64 (release.yml, macos-cpu / arm64) and the archive has upstream's layout, one folder
+# llama-<tag>/ with llama-server and its libraries, so it can be bundled in place of upstream's
+# llama-<build>-bin-macos-arm64.tar.gz. Two things differ from upstream's archive: the embedded chat web UI is left
+# out (the HTTP API is complete), and the build string is fixed by this job instead of read from git:
+#   build_info = b<upstream build number>-<first 9 hex digits of the tag's commit>     (b12651-92a2db7c1 for b12651-lokl.1)
+# Ad-hoc signed, not notarized, like upstream's.
+name: lokl release (macOS arm64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of this fork to build, e.g. b12651-lokl.1"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  macos-arm64:
+    if: github.repository == 'Lokl-engine/llama.cpp'
+    runs-on: macos-26
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Build
+        run: |
+          case "$TAG" in b[0-9]*-lokl.[0-9]*) ;; *) echo "not a fork tag: $TAG"; exit 1;; esac
+          number=${TAG#b}; number=${number%%-*}
+          commit=$(git rev-parse HEAD | cut -c1-9)
+          echo "BUILD_INFO=b$number-$commit" >> "$GITHUB_ENV"
+          cmake -B build \
+            -DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_INSTALL_RPATH='@loader_path' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON \
+            -DGGML_RPC=ON -DLLAMA_CONNECT=ON \
+            -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
+            -DLLAMA_BUILD_NUMBER="$number" -DLLAMA_BUILD_COMMIT="$commit"
+          cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
+
+      - name: Check and pack
+        run: |
+          build/bin/llama-server --version
+          build/bin/llama-server --version 2>&1 | grep -q "commit ${BUILD_INFO#*-}"
+          otool -l build/bin/llama-server | grep -A3 LC_BUILD_VERSION | grep minos
+          cp LICENSE build/bin/
+          tar -czf "llama-$TAG-bin-macos-arm64.tar.gz" -s ",^\.,llama-$TAG," -C build/bin .
+          shasum -a 256 "llama-$TAG-bin-macos-arm64.tar.gz" | tee "llama-$TAG-bin-macos-arm64.tar.gz.sha256"
+
+      - name: Attach to the tag's release
+        run: |
+          sha=$(cut -c1-64 "llama-$TAG-bin-macos-arm64.tar.gz.sha256")
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
+              --notes "Lokl's llama.cpp fork at \`$TAG\`. Built in CI by the \`lokl release (macOS arm64)\` workflow (run $GITHUB_RUN_ID) with the settings of upstream's macOS arm64 release job, without the embedded chat web UI. \`build_info\`: \`$BUILD_INFO\`."
+          fi
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber \
+            "llama-$TAG-bin-macos-arm64.tar.gz" "llama-$TAG-bin-macos-arm64.tar.gz.sha256"
+          echo "llama-$TAG-bin-macos-arm64.tar.gz sha256 $sha, build_info $BUILD_INFO" >> "$GITHUB_STEP_SUMMARY"
