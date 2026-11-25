@@ -3047,6 +3047,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_SHARD"));
     add_opt(common_arg(
+        {"--kv-transform"}, "FNAME",
+        "GGUF file with the learned KV-cache transform of the model, loaded beside the model file\n"
+        "a q4_0 or q4_1 cache (--cache-type-k/-v) needs the transform learned for it, from here or in the model file",
+        [](common_params & params, const std::string & value) {
+            params.model.kv_transform = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_KV_TRANSFORM"));
+    add_opt(common_arg(
         {"-mu", "--model-url"}, "MODEL_URL",
         "model download url (default: unused)",
         [](common_params & params, const std::string & value) {
