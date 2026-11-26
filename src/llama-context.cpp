@@ -4491,9 +4491,17 @@ llama_context * llama_init_from_model(
         const char * env_fixed = getenv("LLAMA_KV_Q4_FIXED_ROTATION");
         bool has_base = false;
         bool has_swa  = false;
+        bool lrot_base = false; // some layer of the group carries a learned transform
+        bool lrot_swa  = false;
         for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
             if (model->hparams.has_kv(il)) {
-                (model->hparams.is_swa(il) ? has_swa : has_base) = true;
+                const bool swa  = model->hparams.is_swa(il);
+                const bool lrot = il < model->layers.size() &&
+                    (model->layers[il].attn_k_lrot != nullptr || model->layers[il].attn_v_lrot != nullptr);
+                (swa ? has_swa : has_base) = true;
+                if (lrot) {
+                    (swa ? lrot_swa : lrot_base) = true;
+                }
             }
         }
         const bool own_swa = has_swa && params.type_swa != GGML_TYPE_COUNT;
@@ -4501,10 +4509,13 @@ llama_context * llama_init_from_model(
             LLAMA_LOG_WARN("%s: the model has no sliding-window layers; the cache type given for them (%s) is not used\n",
                     __func__, ggml_type_name(params.type_swa));
         }
-        struct kv_types { const char * what; bool used; ggml_type k; ggml_type v; };
+        // one entry per group of layers; without a type of their own the sliding-window layers use type_k / type_v
+        struct kv_types { const char * what; bool used; ggml_type k; ggml_type v; bool lrot; };
+        const bool two = has_base && has_swa;
         const kv_types caches[2] = {
-            { own_swa ? "attention cache of the other layers" : "attention cache", own_swa ? has_base : (has_base || has_swa), params.type_k, params.type_v },
-            { "attention cache of the sliding-window layers", own_swa, params.type_swa, params.type_swa },
+            { two ? "attention cache of the other layers" : "attention cache", has_base, params.type_k, params.type_v, lrot_base },
+            { two ? "attention cache of the sliding-window layers" : "attention cache", has_swa,
+              own_swa ? params.type_swa : params.type_k, own_swa ? params.type_swa : params.type_v, lrot_swa },
         };
         for (const auto & c : caches) {
             if (!c.used || !(is_q4(c.k) || is_q4(c.v)) || (env_fixed != nullptr && atoi(env_fixed) != 0)) {
@@ -4514,13 +4525,16 @@ llama_context * llama_init_from_model(
             const std::string have = it == model->gguf_kv.end() ? "" : it->second;
             const std::string want = std::string("learned ") + ggml_type_name(c.k) + " learned+scale+centre";
             const bool same  = c.k == c.v;
-            const bool match = same && (have == want || have.rfind(want + " ", 0) == 0);
+            const bool named = same && (have == want || have.rfind(want + " ", 0) == 0);
+            const bool match = named && c.lrot; // a transform for other layers only does not cover this cache
             if (!match) {
                 LLAMA_LOG_ERROR("%s: a %s / %s %s is refused: %s. A 4-bit cache needs the cache transform learned for "
                         "that format (keys and values alike), in the model file or given with --kv-transform; this model %s. "
                         "q8_0 and f16 work with any model file\n", __func__,
                         ggml_type_name(c.k), ggml_type_name(c.v), c.what,
-                        !same ? "keys and values must use the same 4-bit format" : "the transform for it is missing",
+                        !same ? "keys and values must use the same 4-bit format" :
+                        named ? "the transform given does not cover these layers (a model with sliding-window layers may need --cache-type-swa)" :
+                                "the transform for it is missing",
                         have.empty() ? "carries none" : ("carries \"" + have + "\"").c_str());
                 return nullptr;
             }
