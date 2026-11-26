@@ -371,7 +371,9 @@ static std::string llama_kv_transform_check(const std::string & fname_side, cons
         throw std::runtime_error(format("the KV-cache transform file %s is for a model file of %" PRIu64 " bytes; %s has %" PRIu64,
             fname_side.c_str(), want_size, fname_model.c_str(), have_size));
     }
-    return what;
+    // optional: the cache type the transform asks for on sliding-window layers it does not cover
+    const std::string swa = str(side.get(), "lokl.kv_transform.swa_cache");
+    return swa.empty() ? what : what + "\n" + swa;
 }
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
@@ -381,11 +383,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         // a learned KV-cache transform given as a side file: checked against the model file, then loaded as an
         // extra GGUF beside it
         std::string kv_transform;
+        std::string kv_transform_swa;
         if (params.kv_transform != nullptr && params.kv_transform[0] != '\0') {
             if (fname.empty()) {
                 throw std::runtime_error("a KV-cache transform file needs a model given by path");
             }
             kv_transform = llama_kv_transform_check(params.kv_transform, fname);
+            const size_t nl = kv_transform.find('\n');
+            if (nl != std::string::npos) {
+                kv_transform_swa = kv_transform.substr(nl + 1);
+                kv_transform.resize(nl);
+            }
             if (splits.empty()) {
                 splits.push_back(fname);
             }
@@ -431,6 +439,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!kv_transform.empty()) {
             // what the side file declares reads as the model's own metadata (llama_model_meta_val_str)
             model->gguf_kv["lokl.kv_transform"] = kv_transform;
+            if (!kv_transform_swa.empty()) {
+                model->gguf_kv["lokl.kv_transform.swa_cache"] = kv_transform_swa;
+            }
         }
         try {
             model->load_vocab(ml);

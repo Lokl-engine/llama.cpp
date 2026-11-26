@@ -4504,6 +4504,23 @@ llama_context * llama_init_from_model(
                 }
             }
         }
+        // A transform may cover only part of the layers and name the cache type for the sliding-window layers it
+        // leaves out (lokl.kv_transform.swa_cache, f16 or q8_0). With a 4-bit cache asked for and no type given for
+        // those layers, that type is used, so one cache setting serves every model.
+        if (has_swa && params.type_swa == GGML_TYPE_COUNT && (is_q4(params.type_k) || is_q4(params.type_v))) {
+            const auto it = model->gguf_kv.find("lokl.kv_transform.swa_cache");
+            if (it != model->gguf_kv.end()) {
+                const ggml_type t = it->second == "f16" ? GGML_TYPE_F16 : it->second == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_COUNT;
+                if (t == GGML_TYPE_COUNT) {
+                    LLAMA_LOG_ERROR("%s: the model's KV-cache transform names an unknown cache type for sliding-window layers: \"%s\"\n",
+                            __func__, it->second.c_str());
+                    return nullptr;
+                }
+                params.type_swa = t;
+                LLAMA_LOG_INFO("%s: sliding-window layers use a %s attention cache, as the model's KV-cache transform asks\n",
+                        __func__, ggml_type_name(t));
+            }
+        }
         const bool own_swa = has_swa && params.type_swa != GGML_TYPE_COUNT;
         if (params.type_swa != GGML_TYPE_COUNT && !has_swa) {
             LLAMA_LOG_WARN("%s: the model has no sliding-window layers; the cache type given for them (%s) is not used\n",
