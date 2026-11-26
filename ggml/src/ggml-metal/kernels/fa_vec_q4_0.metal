@@ -97,6 +97,17 @@ template [[host_name("kernel_flash_attn_ext_dec_q4_0_dk128_dv128")]] kernel flas
 template [[host_name("kernel_flash_attn_ext_dec_q4_0_dk256_dv256")]] kernel flash_attn_ext_dec_t kernel_flash_attn_ext_dec<block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 256, 256, 1, 4>;
 template [[host_name("kernel_flash_attn_ext_dec_q4_0_dk512_dv512")]] kernel flash_attn_ext_dec_t kernel_flash_attn_ext_dec<block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 512, 512, 1, 4>;
 
+// single-token decode, several query heads per threadgroup (see kernel_flash_attn_ext_decg)
+typedef decltype(kernel_flash_attn_ext_decg<block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 256, 256, 2>) flash_attn_ext_decg_t;
+
+template [[host_name("kernel_flash_attn_ext_decg_q4_0_dk128_dv128_g2")]] kernel flash_attn_ext_decg_t kernel_flash_attn_ext_decg<block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 128, 128, 2>;
+template [[host_name("kernel_flash_attn_ext_decg_q4_0_dk128_dv128_g3")]] kernel flash_attn_ext_decg_t kernel_flash_attn_ext_decg<block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 128, 128, 3>;
+template [[host_name("kernel_flash_attn_ext_decg_q4_0_dk128_dv128_g4")]] kernel flash_attn_ext_decg_t kernel_flash_attn_ext_decg<block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 128, 128, 4>;
+template [[host_name("kernel_flash_attn_ext_decg_q4_0_dk256_dv256_g2")]] kernel flash_attn_ext_decg_t kernel_flash_attn_ext_decg<block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 256, 256, 2>;
+template [[host_name("kernel_flash_attn_ext_decg_q4_0_dk256_dv256_g3")]] kernel flash_attn_ext_decg_t kernel_flash_attn_ext_decg<block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 256, 256, 3>;
+template [[host_name("kernel_flash_attn_ext_decg_q4_0_dk256_dv256_g4")]] kernel flash_attn_ext_decg_t kernel_flash_attn_ext_decg<block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 256, 256, 4>;
+template [[host_name("kernel_flash_attn_ext_decg_q4_0_dk512_dv512_g2")]] kernel flash_attn_ext_decg_t kernel_flash_attn_ext_decg<block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 512, 512, 2>;
+
 #undef FA_TYPES
 #undef FA_TYPES_F32
 

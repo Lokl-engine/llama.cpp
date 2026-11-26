@@ -2111,7 +2111,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_d
         bool    has_sinks,
         bool    has_scap,
         int32_t nsg,
-        int32_t nwg) {
+        int32_t nwg,
+        int32_t ng) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -2120,11 +2121,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_d
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
-            "flash_attn_ext_dec",
-            ggml_type_name(op->src[1]->type),
-            dk,
-            dv);
+    if (ng == 1) {
+        snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+                "flash_attn_ext_dec",
+                ggml_type_name(op->src[1]->type),
+                dk,
+                dv);
+    } else {
+        // ng query heads per threadgroup
+        snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d_g%d",
+                "flash_attn_ext_decg",
+                ggml_type_name(op->src[1]->type),
+                dk,
+                dv,
+                ng);
+    }
 
     snprintf(name, 256, "%s_mask=%d_sink=%d_scap=%d_nsg=%d_nwg=%d",
             base,

@@ -3265,6 +3265,46 @@ static bool ggml_metal_op_flash_attn_ext_use_dec(const ggml_tensor * op) {
            (dk == 512 && dv == 512);
 }
 
+// query heads per threadgroup of the single-token decode: > 1 if query heads that share a K/V head can be
+// handled together (kernel_flash_attn_ext_decg), which dequantizes each cache row once for all of them
+// the caller checks ggml_metal_op_flash_attn_ext_use_dec and that the heads share their mask
+// GGML_METAL_FA_DEC_GROUP_DISABLE=1 keeps one query head per threadgroup
+static int32_t ggml_metal_op_flash_attn_ext_dec_group(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    static const bool disabled = getenv("GGML_METAL_FA_DEC_GROUP_DISABLE") != nullptr;
+    if (disabled) {
+        return 1;
+    }
+
+    const int64_t nh  = op->src[0]->ne[2];
+    const int64_t nkv = op->src[1]->ne[2];
+
+    if (nh % nkv != 0 || op->src[0]->ne[3] != op->src[1]->ne[3]) {
+        return 1;
+    }
+
+    // query heads per K/V head
+    const int64_t nr = nh/nkv;
+
+    const int64_t dk = op->src[1]->ne[0];
+    const int64_t dv = op->src[2]->ne[0];
+
+    // the largest instantiated group size that divides nr !! sync with kernels/fa_vec_*.metal !!
+    // the group size is limited by the per-thread state of the kernel, which grows with the head size
+    if (dk == 128 && dv == 128) {
+        return nr % 4 == 0 ? 4 : nr % 3 == 0 ? 3 : nr % 2 == 0 ? 2 : 1;
+    }
+    if (dk == 256 && dv == 256) {
+        return nr % 4 == 0 ? 4 : nr % 3 == 0 ? 3 : nr % 2 == 0 ? 2 : 1;
+    }
+    if (dk == 512 && dv == 512) {
+        return nr % 2 == 0 ? 2 : 1;
+    }
+
+    return 1;
+}
+
 // ref: https://github.com/ggml-org/llama.cpp/pull/27390
 // dequantize the quantized KV cache to F16 before running the F16 flash attention kernels
 static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
@@ -4157,9 +4197,15 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // single-token decode over a quantized KV cache
         const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache rows per block !! sync with the kernel !!
 
+        // query heads per threadgroup
+        const int32_t ng = (!has_mask || ne32 == 1) ? ggml_metal_op_flash_attn_ext_dec_group(op) : 1;
+
         // shared memory layout (halfs): the query, then the P matrix and the results of each simdgroup
+        // ng > 1: the S and M and the results of the ng heads of each simdgroup
         auto fa_dec_smem = [&](int64_t nsg) -> size_t {
-            const size_t smem_half = (size_t) ne00 + (size_t) nsg*(2*ncpsg + 2*ne20);
+            const size_t smem_half = ng == 1
+                ? (size_t) ne00 + (size_t) nsg*(2*ncpsg + 2*ne20)
+                : (size_t) nsg*(16*((ng + 3)/4) + 2*ng*ne20);
             return GGML_PAD(smem_half*sizeof(ggml_fp16_t), 16);
         };
 
@@ -4216,7 +4262,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.n_kv_max_padded =*/ 0,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_dec(lib, op, has_mask, has_sinks, has_scap, nsg, nwg);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_dec(lib, op, has_mask, has_sinks, has_scap, nsg, nwg, ng);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -4231,7 +4277,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_tmp,  6);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03*nwg, 32, nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02/ng, ne03*nwg, 32, nsg, 1);
 
         // sync the 2 kernels
         ggml_metal_op_concurrency_reset(ctx);
