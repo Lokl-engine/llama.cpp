@@ -12243,6 +12243,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 8400000, 32, {1, 1}, {2, 1}));
 #endif
 
+    // a small square matrix times a few dozen vectors (f.ex. a rotation applied to the heads of one token)
+    // 9, 13 and 31 vectors do not fill the last group of the kernels that process a few vectors at a time
+    for (ggml_type type_a : { GGML_TYPE_F32, GGML_TYPE_F16, }) {
+        for (int k : { 128, 256, 512, }) {
+            for (int n : { 9, 13, 24, 31, 32, }) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, k, n, k, {1, 1}, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, k, 24, k, {2, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, k, 24, k, {1, 1}, {3, 1}));
+        }
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));

@@ -2780,6 +2780,15 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            false) && (ne11 >= 2 && ne11 <= 8)
          ) ||
          (
+          // a small square matrix times a few dozen vectors (f.ex. a rotation applied to the heads of one token):
+          // the kernel for a few vectors is several times faster here than the matrix-matrix kernel
+          (
+           op->src[0]->type == GGML_TYPE_F32  ||
+           op->src[0]->type == GGML_TYPE_F16  ||
+           op->src[0]->type == GGML_TYPE_BF16 ||
+           false) && (ne11 > 8 && ne11 <= 32 && ne00 == ne01 && ne00 <= 512)
+         ) ||
+         (
           (
            op->src[0]->type == GGML_TYPE_Q4_K ||
            op->src[0]->type == GGML_TYPE_Q5_K ||
@@ -2828,7 +2837,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             case 5:
                 r1ptg = 5; break;
             default:
-                GGML_ABORT("unsupported ne11");
+                // more than 8: groups of 4, the kernel skips the missing vectors of the last group
+                GGML_ASSERT(ne11 > 8);
+                r1ptg = 4; break;
         };
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
