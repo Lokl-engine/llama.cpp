@@ -357,21 +357,21 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
             const auto & lr = model.layers[il];
             if (lrot_k(il)) {  // learned cache transform
                 Kcur = ggml_mul(ctx0, ggml_sub(ctx0, Kcur, lr.attn_k_lrot_mu), lr.attn_k_lrot_s);
-                Kcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_k_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Kcur), n_embd_head, n_head_kv * n_tokens)),
+                Kcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_k_lrot, ggml_reshape_2d(ctx0, llm_cont(ctx0, Kcur), n_embd_head, n_head_kv * n_tokens)),
                                        n_embd_head, n_head_kv, n_tokens);
                 Qcur = ggml_mul(ctx0, Qcur, lr.attn_q_lrot_s);
-                Qcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_k_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Qcur), n_embd_head, n_head * n_tokens)),
+                Qcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_k_lrot, ggml_reshape_2d(ctx0, llm_cont(ctx0, Qcur), n_embd_head, n_head * n_tokens)),
                                        n_embd_head, n_head, n_tokens);
             }
             if (lrot_v(il)) {
                 Vcur = ggml_mul(ctx0, ggml_sub(ctx0, Vcur, lr.attn_v_lrot_mu), lr.attn_v_lrot_s);
-                Vcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_v_lrot, ggml_reshape_2d(ctx0, ggml_cont(ctx0, Vcur), n_embd_head, n_head_kv * n_tokens)),
+                Vcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, lr.attn_v_lrot, ggml_reshape_2d(ctx0, llm_cont(ctx0, Vcur), n_embd_head, n_head_kv * n_tokens)),
                                        n_embd_head, n_head_kv, n_tokens);
                 cur = build_attn(inp_attn, nullptr,
                         nullptr, nullptr, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                         hparams.f_attention_scale, il);
                 // o = (o' R^T) / s + mu per query head, then the output projection
-                cur = ggml_mul_mat(ctx0, lr.attn_v_lrot_inv, ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur), n_embd_head, n_head * n_tokens));
+                cur = ggml_mul_mat(ctx0, lr.attn_v_lrot_inv, ggml_reshape_2d(ctx0, llm_cont(ctx0, cur), n_embd_head, n_head * n_tokens));
                 cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_reshape_3d(ctx0, cur, n_embd_head, n_head, n_tokens), lr.attn_o_lrot_s), lr.attn_o_lrot_mu);
                 cur = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tokens);
                 cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);

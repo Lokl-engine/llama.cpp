@@ -1085,6 +1085,11 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// ggml_cont without the copy when the tensor is contiguous already
+static inline ggml_tensor * llm_cont(ggml_context * ctx, ggml_tensor * t) {
+    return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
+}
+
 struct llm_graph_context {
     const llama_model & model;
 
