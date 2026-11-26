@@ -680,8 +680,7 @@ kernel void kernel_flash_attn_ext_vec(
 //          reduction over the simdgroup and the results of the thread stay in registers for the whole loop
 //
 // the dequantized values are rounded to half, as in the vec kernel, so the results differ from it only by the
-// order of the summations. with a single workgroup the kernel writes the final result, otherwise the workgroups
-// are reduced by kernel_flash_attn_ext_vec_reduce
+// order of the summations. the workgroups are reduced by kernel_flash_attn_ext_vec_reduce
 //
 // a threadgroup handles Q consecutive query heads, which have to share their K/V head and their mask. only Q = 1
 // is instantiated: sharing the dequantization between heads did not pay for the per-thread state that it needs
@@ -1042,22 +1041,17 @@ kernel void kernel_flash_attn_ext_dec(
         FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
             const int64_t rid = iq3*args.ne2*args.ne1 + (iq2 + qq) + iq1*args.ne1;
 
-            // a single workgroup rescales with 1/S and writes the final result
-            const float Sval = NWG == 1 ? (sp[2*qq + 0] == 0.0f ? 0.0f : 1.0f/sp[2*qq + 0]) : 1.0f;
-
             // interleave the workgroup data
             FOR_UNROLL (short jj = 0; jj < NVT; ++jj) {
                 const short j = jj*NW + tiisg;
 
-                dst4[rid*DV4*NWG + NWG*j + iwg] = so4[qq*DV4 + j]*Sval;
+                dst4[rid*DV4*NWG + NWG*j + iwg] = so4[qq*DV4 + j];
             }
 
             // store S and M
-            if (NWG > 1) {
-                if (tiisg == 0) {
-                    dst1[rid*(2*NWG) + 2*iwg + 0] = sp[2*qq + 0];
-                    dst1[rid*(2*NWG) + 2*iwg + 1] = sp[2*qq + 1];
-                }
+            if (tiisg == 0) {
+                dst1[rid*(2*NWG) + 2*iwg + 0] = sp[2*qq + 0];
+                dst1[rid*(2*NWG) + 2*iwg + 1] = sp[2*qq + 1];
             }
         }
     }

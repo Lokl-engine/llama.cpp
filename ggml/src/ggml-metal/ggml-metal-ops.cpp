@@ -3222,8 +3222,11 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
 // workgroups of the single-token decode kernel (kernel_flash_attn_ext_dec), at most
 #define OP_FLASH_ATTN_EXT_DEC_NWG_MAX 256
 
-// caches of up to this many rows are handled by a single workgroup per head
-#define OP_FLASH_ATTN_EXT_DEC_NKV_1WG 4096
+// the single-token decode kernel is used for caches of at least this many rows. with a shorter cache the time
+// of an attention operation is the time to start its threadgroups, and the vec kernel is as fast or faster
+// note: time the operations in a chain as in a model, not side by side: variants that do less work with fewer
+//       threads (f.ex. a single workgroup per head without the reduce pass) win side by side and lose in a chain
+#define OP_FLASH_ATTN_EXT_DEC_NKV_MIN 4096
 
 // single-token decode over a quantized KV cache (kernel_flash_attn_ext_dec): true if the kernel is instantiated
 // for the type and the head size of this op. the caller checks the conditions on the mask, the K/V row lists
@@ -4150,7 +4153,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
     } else if (!use_sparse && !has_rows && !has_bias && !use_kv_f16 && ne11 % OP_FLASH_ATTN_EXT_VEC_NCPSG == 0 &&
-               ggml_metal_op_flash_attn_ext_use_dec(op)) {
+               ne11 >= OP_FLASH_ATTN_EXT_DEC_NKV_MIN && ggml_metal_op_flash_attn_ext_use_dec(op)) {
         // single-token decode over a quantized KV cache
         const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache rows per block !! sync with the kernel !!
 
@@ -4160,24 +4163,15 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             return GGML_PAD(smem_half*sizeof(ggml_fp16_t), 16);
         };
 
-        // short caches: a single workgroup per head that writes the final result, with about 16 blocks of cache
-        //               rows per simdgroup. there is no separate pass for reducing the workgroups
-        // long caches:  workgroups of 4 simdgroups, and more of them as the cache grows, so that each simdgroup
-        //               has only a few blocks of rows to process
+        // each workgroup handles nsg*ncpsg cache rows at a time
+        // long caches use more workgroups, so that each simdgroup has only a few blocks of rows to process
         int64_t nsg = 1;
-        int32_t nwg = 1;
-        if (ne11 <= OP_FLASH_ATTN_EXT_DEC_NKV_1WG) {
-            while (32*nsg*ncpsg <= ne11 && nsg < 16 && fa_dec_smem(2*nsg) <= props_dev->max_theadgroup_memory_size) {
-                nsg *= 2;
-            }
-        } else {
-            nwg = 32;
-            while (2*nwg*nsg*ncpsg < ne11 && nsg < 4 && fa_dec_smem(2*nsg) <= props_dev->max_theadgroup_memory_size) {
-                nsg *= 2;
-            }
-            while (4*nwg*nsg*ncpsg < ne11 && nwg < OP_FLASH_ATTN_EXT_DEC_NWG_MAX) {
-                nwg *= 2;
-            }
+        int32_t nwg = 32;
+        while (2*nwg*nsg*ncpsg < ne11 && nsg < 4 && fa_dec_smem(2*nsg) <= props_dev->max_theadgroup_memory_size) {
+            nsg *= 2;
+        }
+        while (4*nwg*nsg*ncpsg < ne11 && nwg < OP_FLASH_ATTN_EXT_DEC_NWG_MAX) {
+            nwg *= 2;
         }
 
         const size_t smem = fa_dec_smem(nsg);
@@ -4226,8 +4220,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
-        // with 1 workgroup the result goes directly into dst, otherwise the results of the workgroups go into
-        // the temp buffer
+        // write the results of the workgroups into the temp buffer
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
@@ -4235,16 +4228,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
-        ggml_metal_encoder_set_buffer  (enc, nwg == 1 ? bid_dst : bid_tmp, 6);
+        ggml_metal_encoder_set_buffer  (enc, bid_tmp,  6);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03*nwg, 32, nsg, 1);
 
-        // reduce the results from the workgroups
-        if (nwg > 1) {
-            // sync the 2 kernels
-            ggml_metal_op_concurrency_reset(ctx);
+        // sync the 2 kernels
+        ggml_metal_op_concurrency_reset(ctx);
 
+        // reduce the results from the workgroups
+        {
             const int32_t nrows = ne1*ne2*ne3;
 
             ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = {
