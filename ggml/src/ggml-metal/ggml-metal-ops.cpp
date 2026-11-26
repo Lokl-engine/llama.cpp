@@ -11,6 +11,7 @@
 #include "ggml-metal-tuning.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <algorithm>
 #include <limits>
 #include <cmath>
@@ -3207,6 +3208,49 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     return (ne01 < 20) && (ne00 % 32 == 0);
 }
 
+// workgroups of the single-token decode kernel (kernel_flash_attn_ext_dec), at most
+#define OP_FLASH_ATTN_EXT_DEC_NWG_MAX 256
+
+// caches of up to this many rows are handled by a single workgroup per head
+#define OP_FLASH_ATTN_EXT_DEC_NKV_1WG 4096
+
+// single-token decode over a quantized KV cache (kernel_flash_attn_ext_dec): true if the kernel is instantiated
+// for the type and the head size of this op. the caller checks the conditions on the mask, the K/V row lists
+// and the number of cache rows
+// GGML_METAL_FA_DEC_DISABLE=1 restores the previous kernel choice
+static bool ggml_metal_op_flash_attn_ext_use_dec(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    static const bool disabled = getenv("GGML_METAL_FA_DEC_DISABLE") != nullptr;
+    if (disabled) {
+        return false;
+    }
+
+    // a single query row
+    if (op->src[0]->ne[1] != 1) {
+        return false;
+    }
+
+    switch (op->src[1]->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            break;
+        default:
+            return false;
+    }
+
+    const int64_t dk = op->src[1]->ne[0];
+    const int64_t dv = op->src[2]->ne[0];
+
+    // instantiated head sizes !! sync with kernels/fa_vec_*.metal !!
+    return (dk == 128 && dv == 128) ||
+           (dk == 256 && dv == 256) ||
+           (dk == 512 && dv == 512);
+}
+
 // ref: https://github.com/ggml-org/llama.cpp/pull/27390
 // dequantize the quantized KV cache to F16 before running the F16 flash attention kernels
 static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
@@ -3481,10 +3525,13 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
         const int64_t nwg = 32;
         const int64_t ne01_max = std::min(ne01, 32);
 
+        // the single-token decode kernel uses up to OP_FLASH_ATTN_EXT_DEC_NWG_MAX workgroups for its one query row
+        const int64_t nres = std::max<int64_t>(ne01_max*nwg, OP_FLASH_ATTN_EXT_DEC_NWG_MAX);
+
         // temp buffer for writing the results from each workgroup
         // - ne20: the size of the Value head
         // -  + 2: the S and M values for each intermediate result
-        res += ggml_type_size(GGML_TYPE_F32)*(ne01_max*ne02*ne03*nwg*(ne20 + 2));
+        res += ggml_type_size(GGML_TYPE_F32)*(nres*ne02*ne03*(ne20 + 2));
     }
 
     return res;
@@ -4091,6 +4138,117 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
+    } else if (!use_sparse && !has_rows && !has_bias && !use_kv_f16 && ne11 % OP_FLASH_ATTN_EXT_VEC_NCPSG == 0 &&
+               ggml_metal_op_flash_attn_ext_use_dec(op)) {
+        // single-token decode over a quantized KV cache
+        const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache rows per block !! sync with the kernel !!
+
+        // shared memory layout (halfs): the query, then the P matrix and the results of each simdgroup
+        auto fa_dec_smem = [&](int64_t nsg) -> size_t {
+            const size_t smem_half = (size_t) ne00 + (size_t) nsg*(2*ncpsg + 2*ne20);
+            return GGML_PAD(smem_half*sizeof(ggml_fp16_t), 16);
+        };
+
+        // short caches: a single workgroup per head that writes the final result, with about 16 blocks of cache
+        //               rows per simdgroup. there is no separate pass for reducing the workgroups
+        // long caches:  workgroups of 4 simdgroups, and more of them as the cache grows, so that each simdgroup
+        //               has only a few blocks of rows to process
+        int64_t nsg = 1;
+        int32_t nwg = 1;
+        if (ne11 <= OP_FLASH_ATTN_EXT_DEC_NKV_1WG) {
+            while (32*nsg*ncpsg <= ne11 && nsg < 16 && fa_dec_smem(2*nsg) <= props_dev->max_theadgroup_memory_size) {
+                nsg *= 2;
+            }
+        } else {
+            nwg = 32;
+            while (2*nwg*nsg*ncpsg < ne11 && nsg < 4 && fa_dec_smem(2*nsg) <= props_dev->max_theadgroup_memory_size) {
+                nsg *= 2;
+            }
+            while (4*nwg*nsg*ncpsg < ne11 && nwg < OP_FLASH_ATTN_EXT_DEC_NWG_MAX) {
+                nwg *= 2;
+            }
+        }
+
+        const size_t smem = fa_dec_smem(nsg);
+
+        GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+        GGML_ASSERT(nwg <= OP_FLASH_ATTN_EXT_DEC_NWG_MAX);
+        GGML_ASSERT(ne01*ne02*ne03 == ne1*ne2*ne3);
+
+        ggml_metal_kargs_flash_attn_ext_vec args = {
+            /*.ne01          =*/ ne01,
+            /*.ne02          =*/ ne02,
+            /*.ne03          =*/ ne03,
+            /*.nb01          =*/ nb01,
+            /*.nb02          =*/ nb02,
+            /*.nb03          =*/ nb03,
+            /*.ne11          =*/ ne11,
+            /*.ne_12_2       =*/ ne12,
+            /*.ne_12_3       =*/ ne13,
+            /*.ns10          =*/ (int32_t) (nb11/nb10),
+            /*.nb11          =*/ nb11,
+            /*.nb12          =*/ nb12,
+            /*.nb13          =*/ nb13,
+            /*.ns20          =*/ (int32_t) (nb21/nb20),
+            /*.nb21          =*/ nb21,
+            /*.nb22          =*/ nb22,
+            /*.nb23          =*/ nb23,
+            /*.ne31          =*/ ne31,
+            /*.ne32          =*/ ne32,
+            /*.ne33          =*/ ne33,
+            /*.nb31          =*/ nb31,
+            /*.nb32          =*/ nb32,
+            /*.nb33          =*/ nb33,
+            /*.ne1           =*/ ne1,
+            /*.ne2           =*/ ne2,
+            /*.ne3           =*/ ne3,
+            /*.scale         =*/ scale,
+            /*.max_bias      =*/ max_bias,
+            /*.m0            =*/ m0,
+            /*.m1            =*/ m1,
+            /*.n_head_log2   =*/ n_head_log2,
+            /*.logit_softcap =*/ logit_softcap,
+            /*.n_kv_max_padded =*/ 0,
+        };
+
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_dec(lib, op, has_mask, has_sinks, has_scap, nsg, nwg);
+
+        GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+        // with 1 workgroup the result goes directly into dst, otherwise the results of the workgroups go into
+        // the temp buffer
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
+        ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+        ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
+        ggml_metal_encoder_set_buffer  (enc, nwg == 1 ? bid_dst : bid_tmp, 6);
+
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03*nwg, 32, nsg, 1);
+
+        // reduce the results from the workgroups
+        if (nwg > 1) {
+            // sync the 2 kernels
+            ggml_metal_op_concurrency_reset(ctx);
+
+            const int32_t nrows = ne1*ne2*ne3;
+
+            ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = {
+                nrows,
+            };
+
+            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline0);
+            ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*std::min(nwg, 32), 1, 1);
+        }
     } else {
         // half4x4 kernel
         // sparse: the index lists are per query row, so a threadgroup can share KV with Q == 1 only

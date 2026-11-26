@@ -373,17 +373,29 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 
     const uint64_t rid = tgpig;
 
+    // each thread of a simdgroup reduces NWG/32 workgroups (NWG is 32 or a multiple of it)
+    constexpr short NWT_MAX = 8;
+
+    const short nwt = max(NWG/32, 1);
     const short iwg = tiisg;
 
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV*NWG;
 
-    float S = ss[rid*(2*NWG) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG) + 2*iwg + 1];
+    float Mt = ss[rid*(2*NWG) + 2*iwg + 1];
+    for (short r = 1; r < nwt; ++r) {
+        Mt = max(Mt, ss[rid*(2*NWG) + 2*(32*r + iwg) + 1]);
+    }
 
-    const float m  = simd_max(M);
-    const float ms = exp(M - m);
+    const float m = simd_max(Mt);
 
-    S = simd_sum(S*ms);
+    float ms[NWT_MAX];
+    float St = 0.0f;
+    for (short r = 0; r < nwt; ++r) {
+        ms[r] = exp(ss[rid*(2*NWG) + 2*(32*r + iwg) + 1] - m);
+        St += ss[rid*(2*NWG) + 2*(32*r + iwg) + 0]*ms[r];
+    }
+
+    float S = simd_sum(St);
     S = S == 0.0f ? 0.0f : 1.0f/S;
 
     const short DV4 = DV/4;
@@ -391,8 +403,14 @@ kernel void kernel_flash_attn_ext_vec_reduce(
     device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG;
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
-    for (short i = sgitg; i < DV4; i += NWG) {
-        const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
+    // the threadgroup has min(NWG, 32) simdgroups
+    for (short i = sgitg; i < DV4; i += min(NWG, 32)) {
+        float4 vt = htmp4[i*NWG + iwg]*ms[0];
+        for (short r = 1; r < nwt; ++r) {
+            vt += htmp4[i*NWG + 32*r + iwg]*ms[r];
+        }
+
+        const float4 v = simd_sum(vt);
 
         if (iwg == 0) {
             dst4[i] = v*S;

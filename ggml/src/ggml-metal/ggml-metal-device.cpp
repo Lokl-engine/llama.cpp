@@ -2104,6 +2104,54 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_dec(
+        ggml_metal_library_t lib,
+        const ggml_tensor * op,
+        bool    has_mask,
+        bool    has_sinks,
+        bool    has_scap,
+        int32_t nsg,
+        int32_t nwg) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    char base[256];
+    char name[256];
+
+    const int32_t dk = (int32_t) op->src[1]->ne[0];
+    const int32_t dv = (int32_t) op->src[2]->ne[0];
+
+    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+            "flash_attn_ext_dec",
+            ggml_type_name(op->src[1]->type),
+            dk,
+            dv);
+
+    snprintf(name, 256, "%s_mask=%d_sink=%d_scap=%d_nsg=%d_nwg=%d",
+            base,
+            has_mask,
+            has_sinks,
+            has_scap,
+            nsg, nwg);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool(cv, has_mask,  FC_FLASH_ATTN_EXT_DEC + 0);
+        ggml_metal_cv_set_bool(cv, has_sinks, FC_FLASH_ATTN_EXT_DEC + 1);
+        ggml_metal_cv_set_bool(cv, has_scap,  FC_FLASH_ATTN_EXT_DEC + 2);
+
+        ggml_metal_cv_set_int32(cv, nsg, FC_FLASH_ATTN_EXT_DEC + 10);
+        ggml_metal_cv_set_int32(cv, nwg, FC_FLASH_ATTN_EXT_DEC + 11);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
         ggml_metal_library_t lib,
         const ggml_tensor * op,

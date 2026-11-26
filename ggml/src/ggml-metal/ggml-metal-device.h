@@ -247,6 +247,15 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t ns10,
         int32_t ns20);
 
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_dec(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op,
+        bool    has_mask,
+        bool    has_sinks,
+        bool    has_scap,
+        int32_t nsg,
+        int32_t nwg);
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,

@@ -667,3 +667,401 @@ kernel void kernel_flash_attn_ext_vec(
 #undef NS10
 #undef NS20
 }
+
+// single-token decode over a quantized KV cache
+//
+// a variant of the vec kernel above for a single query row (ne01 == 1) and a quantized KV cache. with a
+// quantized KV most of the time goes into the dequantization, the rest of the work per cache row has to be
+// as small as possible:
+//
+// - Q*K^T: as in the vec kernel, NL = 32/NE threads hold a slice of the head elements and process NE cache
+//          rows at a time. each thread keeps only the score of the one row of the block that it owns
+// - (Q*K^T)*V: each thread owns DV/32 elements of the result and runs over all rows of the block: there is no
+//          reduction over the simdgroup and the results of the thread stay in registers for the whole loop
+//
+// the dequantized values are rounded to half, as in the vec kernel, so the results differ from it only by the
+// order of the summations. with a single workgroup the kernel writes the final result, otherwise the workgroups
+// are reduced by kernel_flash_attn_ext_vec_reduce
+//
+// a threadgroup handles Q consecutive query heads, which have to share their K/V head and their mask. only Q = 1
+// is instantiated: sharing the dequantization between heads did not pay for the per-thread state that it needs
+// (measured on Apple10). note that the generated code is sensitive to the form of this kernel, check the head
+// sizes 256 and 512 when changing it
+//
+// requires (enforced by the host): ne01 == 1, ne11 % 32 == 0, no ALiBi bias, no K/V row lists
+constant bool FC_flash_attn_ext_dec_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_DEC + 0)]];
+constant bool FC_flash_attn_ext_dec_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_DEC + 1)]];
+constant bool FC_flash_attn_ext_dec_has_scap  [[function_constant(FC_FLASH_ATTN_EXT_DEC + 2)]];
+
+constant int32_t FC_flash_attn_ext_dec_nsg [[function_constant(FC_FLASH_ATTN_EXT_DEC + 10)]];
+constant int32_t FC_flash_attn_ext_dec_nwg [[function_constant(FC_FLASH_ATTN_EXT_DEC + 11)]];
+
+template<
+    typename kd_t,  // key type in device memory
+    short nl_k,
+    void (*deq_k_t4)(device const kd_t *, short, thread half4 &),
+    typename vd_t,  // value type in device memory
+    short nl_v,
+    void (*deq_v_t4)(device const vd_t *, short, thread half4 &),
+    short DK,       // K head size
+    short DV,       // V head size
+    short Q,        // query heads per threadgroup
+    short NE>       // cache rows processed at a time in Q*K^T
+kernel void kernel_flash_attn_ext_dec(
+        constant ggml_metal_kargs_flash_attn_ext_vec & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * sinks,
+        device       char * dst,
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+#define NWG (FC_flash_attn_ext_dec_nwg)
+#define NSG (FC_flash_attn_ext_dec_nsg)
+
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NL  = NW/NE;  // threads per cache row in Q*K^T
+    constexpr short C   = NW;     // cache rows per block
+
+    constexpr short DK4 = DK/4;
+    constexpr short DV4 = DV/4;
+
+    constexpr short NKT = DK4/NL; // K elements (x4) per thread and row
+    constexpr short NVT = DV4/NW; // V elements (x4) per thread and row
+
+    // keep the results of the thread in registers during the loop over the KV cache when there are few of them,
+    // in shared memory otherwise
+    constexpr bool OREG = Q*NVT <= 8;
+
+    static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
+    static_assert(DV4 % NW == 0, "DV4 must be divisible by the simdgroup size");
+
+    const short iwg = tgpig[2]%NWG;
+
+    const ushort iq3 = tgpig[2]/NWG;
+    const ushort iq2 = tgpig[1]*Q; // first query head of the threadgroup
+    const ushort iq1 = tgpig[0];
+
+    // shared memory (in halfs): the queries, followed by the P matrix and the results of each simdgroup
+    constexpr int SMEM_Q  = Q*DK;
+    constexpr int SMEM_SG = 2*Q*C + 2*Q*DV;
+
+    threadgroup half4  * sq4 = (threadgroup half4  *) shmem_f16;
+    threadgroup float  * sp  = (threadgroup float  *) (shmem_f16 + SMEM_Q + sgitg*SMEM_SG);
+    threadgroup float4 * sp4 = (threadgroup float4 *) (shmem_f16 + SMEM_Q + sgitg*SMEM_SG);
+    threadgroup float4 * so4 = (threadgroup float4 *) (shmem_f16 + SMEM_Q + sgitg*SMEM_SG + 2*Q*C);
+
+    {
+        q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
+
+        const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+        const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+        k += ikv2*args.nb12 + ikv3*args.nb13;
+        v += ikv2*args.nb22 + ikv3*args.nb23;
+    }
+
+    // load the Q query heads to shared memory
+    if (sgitg == 0) {
+        FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+            device const float4 * q4 = (device const float4 *) (q + qq*args.nb02);
+            for (short i = tiisg; i < DK4; i += NW) {
+                sq4[qq*DK4 + i] = (half4) q4[i];
+            }
+        }
+    }
+
+    // zero out the results
+    FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+        FOR_UNROLL (short jj = 0; jj < NVT; ++jj) {
+            so4[qq*DV4 + jj*NW + tiisg] = 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        float S[Q];
+        float M[Q];
+        FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+            S[qq] = 0.0f;
+            M[qq] = -FLT_MAX/2;
+        }
+
+        // thread indices inside the simdgroup
+        const short tx = tiisg%NL;
+        const short ty = tiisg/NL;
+
+        // the row of the block whose scores this thread keeps
+        const short rown = NE*tx + ty;
+
+        // the results of this thread (OREG)
+        float4 ro[Q][NVT];
+        FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+            FOR_UNROLL (short jj = 0; jj < NVT; ++jj) {
+                ro[qq][jj] = 0.0f;
+            }
+        }
+
+        // the mask (shared by the Q query heads)
+        device const half * pm = (device const half *) (mask + iq1*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+
+        // loop over the KV cache, each simdgroup handles blocks of C rows
+        for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
+            const int ic = ic0*C;
+            if (ic >= args.ne11) {
+                break;
+            }
+
+            float mown = 0.0f;
+
+            // skip -INF mask
+            if (FC_flash_attn_ext_dec_has_mask) {
+                mown = pm[ic + rown];
+
+                if (simd_max(mown) <= -MAXHALF) {
+                    continue;
+                }
+            }
+
+            // Q*K^T
+            float sown[Q];
+            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                sown[qq] = 0.0f;
+            }
+
+            // the rows of the block (32-bit offsets from the first row)
+            device const char * kb = k + ic*args.nb11;
+            device const char * vb = v + ic*args.nb21;
+
+            const int nb11 = args.nb11;
+            const int nb21 = args.nb21;
+
+            FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                device const kd_t * pk = (device const kd_t *) (kb + (NE*cc + ty)*nb11);
+
+                float mqk[Q];
+                FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                    mqk[qq] = 0.0f;
+                }
+
+                FOR_UNROLL (short ii = 0; ii < NKT; ++ii) {
+                    const short i = ii*NL + tx;
+
+                    half4 mk;
+                    deq_k_t4(pk + i/nl_k, i%nl_k, mk);
+
+                    const float4 mkf = (float4) mk;
+
+                    FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                        mqk[qq] += dot(mkf, (float4) sq4[qq*DK4 + i]);
+                    }
+                }
+
+                FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                    if (NE == 1) {
+                        mqk[qq] = simd_sum(mqk[qq]);
+                    } else {
+                        // reduce over the NL threads of the row, then broadcast
+                        if (NE <= 1) {
+                            mqk[qq] += simd_shuffle_down(mqk[qq], 16);
+                        }
+                        if (NE <= 2) {
+                            mqk[qq] += simd_shuffle_down(mqk[qq],  8);
+                        }
+                        if (NE <= 4) {
+                            mqk[qq] += simd_shuffle_down(mqk[qq],  4);
+                        }
+                        if (NE <= 8) {
+                            mqk[qq] += simd_shuffle_down(mqk[qq],  2);
+                        }
+                        if (NE <= 16) {
+                            mqk[qq] += simd_shuffle_down(mqk[qq],  1);
+                        }
+
+                        mqk[qq] = simd_shuffle(mqk[qq], NL*ty);
+                    }
+
+                    sown[qq] = tx == cc ? mqk[qq] : sown[qq];
+                }
+            }
+
+            // online softmax, the P matrix (Q rows, C columns) goes to shared memory
+            float MS[Q];
+            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                float s;
+                if (!FC_flash_attn_ext_dec_has_scap) {
+                    s = fma(sown[qq], args.scale, mown);
+                } else {
+                    s = args.logit_softcap*precise::tanh(sown[qq]*args.scale) + mown;
+                }
+
+                const float m = M[qq];
+
+                M[qq] = simd_max(max(M[qq], s));
+
+                const float ms = exp(m - M[qq]);
+                const float vs = exp(s - M[qq]);
+
+                S[qq] = S[qq]*ms + simd_sum(vs);
+
+                sp[qq*C + rown] = vs;
+
+                MS[qq] = ms;
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // O = diag(ms)*O + (Q*K^T)*V
+            {
+                float4 lo[Q][NVT];
+                FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                    FOR_UNROLL (short jj = 0; jj < NVT; ++jj) {
+                        lo[qq][jj] = (OREG ? ro[qq][jj] : so4[qq*DV4 + jj*NW + tiisg])*MS[qq];
+                    }
+                }
+
+                // 4 rows of the block at a time, their elements of the P matrix are loaded together
+                FOR_UNROLL (short c4 = 0; c4 < C/4; ++c4) {
+                    float4 p4[Q];
+                    FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                        p4[qq] = sp4[qq*(C/4) + c4];
+                    }
+
+                    FOR_UNROLL (short c1 = 0; c1 < 4; ++c1) {
+                        device const vd_t * pv = (device const vd_t *) (vb + (4*c4 + c1)*nb21);
+
+                        FOR_UNROLL (short jj = 0; jj < NVT; ++jj) {
+                            const short j = jj*NW + tiisg;
+
+                            half4 mv;
+                            deq_v_t4(pv + j/nl_v, j%nl_v, mv);
+
+                            const float4 mvf = (float4) mv;
+
+                            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                                lo[qq][jj] += mvf*p4[qq][c1];
+                            }
+                        }
+                    }
+                }
+
+                FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                    FOR_UNROLL (short jj = 0; jj < NVT; ++jj) {
+                        if (OREG) {
+                            ro[qq][jj] = lo[qq][jj];
+                        } else {
+                            so4[qq*DV4 + jj*NW + tiisg] = lo[qq][jj];
+                        }
+                    }
+                }
+            }
+        }
+
+        if (OREG) {
+            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                FOR_UNROLL (short jj = 0; jj < NVT; ++jj) {
+                    so4[qq*DV4 + jj*NW + tiisg] = ro[qq][jj];
+                }
+            }
+        }
+
+        if (FC_flash_attn_ext_dec_has_sinks && sgitg == 0 && iwg == 0) {
+            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                const float m = M[qq];
+                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2 + qq] : -FLT_MAX/2;
+
+                M[qq] = simd_max(max(M[qq], s));
+
+                const float ms = exp(m - M[qq]);
+                const float vs = exp(s - M[qq]);
+
+                S[qq] = S[qq]*ms + simd_sum(vs);
+
+                FOR_UNROLL (short jj = 0; jj < NVT; ++jj) {
+                    so4[qq*DV4 + jj*NW + tiisg] *= ms;
+                }
+            }
+        }
+
+        // these are needed for reducing the results from the simdgroups (reuse the P buffer)
+        if (tiisg == 0) {
+            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                sp[2*qq + 0] = S[qq];
+                sp[2*qq + 1] = M[qq];
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // parallel reduce over the simdgroups
+    for (short r = NSG/2; r > 0; r >>= 1) {
+        if (sgitg < r) {
+            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                const float S0 = sp[                  2*qq + 0];
+                const float S1 = sp[r*(SMEM_SG/2) +   2*qq + 0];
+
+                const float M0 = sp[                  2*qq + 1];
+                const float M1 = sp[r*(SMEM_SG/2) +   2*qq + 1];
+
+                const float Mx  = max(M0, M1);
+
+                const float ms0 = exp(M0 - Mx);
+                const float ms1 = exp(M1 - Mx);
+
+                const float Sx  = S0*ms0 + S1*ms1;
+
+                if (tiisg == 0) {
+                    sp[2*qq + 0] = Sx;
+                    sp[2*qq + 1] = Mx;
+                }
+
+                // O_0 = diag(ms0)*O_0 + diag(ms1)*O_1
+                FOR_UNROLL (short jj = 0; jj < NVT; ++jj) {
+                    const short j = qq*DV4 + jj*NW + tiisg;
+
+                    so4[j] = so4[j]*ms0 + so4[j + r*(SMEM_SG/8)]*ms1;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // store the result of the workgroup, to be reduced by kernel_flash_attn_ext_vec_reduce
+    if (sgitg == 0) {
+        const int64_t nrows = args.ne3*args.ne2*args.ne1;
+
+        device float4 * dst4 = (device float4 *) dst;
+        device float  * dst1 = (device float  *) dst + nrows*DV*NWG; // the S and M are stored after the results
+
+        FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+            const int64_t rid = iq3*args.ne2*args.ne1 + (iq2 + qq) + iq1*args.ne1;
+
+            // a single workgroup rescales with 1/S and writes the final result
+            const float Sval = NWG == 1 ? (sp[2*qq + 0] == 0.0f ? 0.0f : 1.0f/sp[2*qq + 0]) : 1.0f;
+
+            // interleave the workgroup data
+            FOR_UNROLL (short jj = 0; jj < NVT; ++jj) {
+                const short j = jj*NW + tiisg;
+
+                dst4[rid*DV4*NWG + NWG*j + iwg] = so4[qq*DV4 + j]*Sval;
+            }
+
+            // store S and M
+            if (NWG > 1) {
+                if (tiisg == 0) {
+                    dst1[rid*(2*NWG) + 2*iwg + 0] = sp[2*qq + 0];
+                    dst1[rid*(2*NWG) + 2*iwg + 1] = sp[2*qq + 1];
+                }
+            }
+        }
+    }
+
+#undef NWG
+#undef NSG
+}
