@@ -2770,6 +2770,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
     add_opt(common_arg(
+        {"--moe-cache-direct-io"},
+        "read the MoE cache misses from the model file into the cache instead of copying them from the experts kept in the CPU. "
+        "with a memory-mapped model (--load-mode mmap) the experts in the CPU are then never read into RAM, so the model can be larger than the RAM. "
+        "the cache must be in host-visible GPU memory (Metal). reads in flight: LLAMA_MOE_CACHE_IO_THREADS (default: 4)",
+        [](common_params & params) {
+            params.moe_cache_direct_io = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_DIRECT_IO"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

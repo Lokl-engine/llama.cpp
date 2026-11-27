@@ -16,7 +16,166 @@
 #include <unordered_map>
 #include <vector>
 
+#ifndef _WIN32
+#include <condition_variable>
+#include <fcntl.h>
+#include <mutex>
+#include <thread>
+#include <unistd.h>
+#endif
+
 namespace {
+
+#ifndef _WIN32
+// reads byte ranges of the model files into memory, with up to n_threads reads in flight (the caller takes part)
+// used to fill the MoE cache from the file when the host experts are not meant to be touched (direct I/O)
+struct moe_cache_reader {
+    struct job {
+        int       fd;
+        size_t    offs;
+        uint8_t * dst;
+        size_t    size;
+    };
+
+    explicit moe_cache_reader(int n_threads) {
+        for (int i = 1; i < n_threads; ++i) {
+            threads.emplace_back([this] { work(); });
+        }
+    }
+
+    ~moe_cache_reader() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            quit = true;
+        }
+        cv_work.notify_all();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
+
+    // returns when all the jobs are read, false if a read failed
+    bool run(const std::vector<job> & js) {
+        if (js.empty()) {
+            return true;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        jobs   = &js;
+        next   = 0;
+        done   = 0;
+        failed = false;
+        if (js.size() > 1) {
+            cv_work.notify_all();
+        }
+        while (next < js.size()) {
+            const job j = js[next++];
+            lock.unlock();
+            const bool ok = read(j);
+            lock.lock();
+            failed = failed || !ok;
+            done++;
+        }
+        cv_done.wait(lock, [&] { return done == js.size(); });
+        jobs = nullptr;
+        return !failed;
+    }
+
+    // a read goes around the file cache only if its file offset, its size and its address are multiples of the device block
+    // (measured on macOS with F_NOCACHE: any other read is served through the cache and stays in it)
+    static constexpr size_t block = 4096;
+
+    static bool is_aligned(size_t offs, size_t size, const void * dst) {
+        return offs % block == 0 && size % block == 0 && (uintptr_t) dst % block == 0;
+    }
+
+private:
+    // read size bytes at offs, or up to the end of the file if min_size bytes are read
+    static bool read_all(int fd, uint8_t * dst, size_t size, size_t offs, size_t min_size) {
+        size_t n = 0;
+        while (n < size) {
+            const ssize_t r = pread(fd, dst + n, size - n, (off_t) (offs + n));
+            if (r < 0) {
+                return false;
+            }
+            if (r == 0) {
+                return n >= min_size;
+            }
+            n += (size_t) r;
+        }
+        return true;
+    }
+
+    // page-aligned buffer of the calling thread, for the reads that are not aligned
+    struct bounce {
+        uint8_t * data = nullptr;
+        size_t    size = 0;
+
+        ~bounce() {
+            free(data);
+        }
+
+        uint8_t * get(size_t n) {
+            if (n > size) {
+                free(data);
+                data = nullptr;
+                size = 0;
+                if (posix_memalign((void **) &data, 16384, n) != 0) {
+                    data = nullptr;
+                    return nullptr;
+                }
+                size = n;
+            }
+            return data;
+        }
+    };
+
+    static bool read(const job & j) {
+        if (is_aligned(j.offs, j.size, j.dst)) {
+            return read_all(j.fd, j.dst, j.size, j.offs, j.size);
+        }
+
+        // tensor data in a GGUF file is aligned to 32 bytes by default: read the blocks that hold the range
+        // into an aligned buffer and copy the range from there, which costs one copy but keeps the file cache out
+        static thread_local bounce buf;
+        const size_t beg = j.offs/block*block;
+        const size_t end = (j.offs + j.size + block - 1)/block*block;
+        uint8_t * tmp = buf.get(end - beg);
+        if (tmp == nullptr || !read_all(j.fd, tmp, end - beg, beg, j.offs - beg + j.size)) {
+            return false;
+        }
+        memcpy(j.dst, tmp + (j.offs - beg), j.size);
+        return true;
+    }
+
+    void work() {
+        std::unique_lock<std::mutex> lock(mu);
+        for (;;) {
+            cv_work.wait(lock, [&] { return quit || (jobs != nullptr && next < jobs->size()); });
+            if (quit) {
+                return;
+            }
+            const job j = (*jobs)[next++];
+            lock.unlock();
+            const bool ok = read(j);
+            lock.lock();
+            failed = failed || !ok;
+            if (++done == jobs->size()) {
+                cv_done.notify_one();
+            }
+        }
+    }
+
+    std::vector<std::thread> threads;
+    std::mutex mu;
+    std::condition_variable cv_work;
+    std::condition_variable cv_done;
+    const std::vector<job> * jobs = nullptr;
+    size_t next = 0;
+    size_t done = 0;
+    bool quit   = false;
+    bool failed = false;
+};
+#endif
 
 // ClassLRU: one LRU list per frequency class, over the experts of a group of layers
 // slot_map[il][e] is the slot of expert e of layer il, n_slots or later if not cached, the host slot map tensor
@@ -330,6 +489,7 @@ struct llama_moe_cache::impl {
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
         size_t buf_size = 0;
+        bool host_writable = false; // the banks are host memory that the device reads in place, so a file read can land in them
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -351,6 +511,9 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
         uint32_t cpu_acc = 0;               // fraction of a miss carried over to the next plan, in 1/65536
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+
+        // direct I/O: the model file descriptor and the offset of each host expert tensor, empty if the misses are copied from host memory
+        std::vector<std::pair<int, size_t>> files;
     };
 
     struct binding {
@@ -364,6 +527,12 @@ struct llama_moe_cache::impl {
         size_t misses = 0;
         size_t cpu    = 0; // misses computed on the CPU
         size_t bytes  = 0;
+        size_t  read_bytes = 0; // of bytes, read from the model file
+        size_t  reads      = 0;
+        int64_t read_us    = 0; // time waiting for these reads
+        int64_t sync_us    = 0; // time waiting for the device to compute the selected experts (and the work queued before)
+        int64_t copy_us    = 0; // time in the copy callback, including the two above
+        size_t  lookups    = 0;
     };
 
     static constexpr int64_t max_batch = 32;
@@ -384,6 +553,14 @@ struct llama_moe_cache::impl {
     std::vector<moe_cache_lru::fill> fills;
     std::vector<moe_cache_lru::fill> cpu;
 
+#ifndef _WIN32
+    // direct I/O: the misses are read from the model file into the banks, the host experts are not touched
+    std::unique_ptr<moe_cache_reader> reader;
+    std::vector<moe_cache_reader::job> jobs;
+#endif
+
+    mutable bool warned_large_batch = false;
+
     float    cpu_share = 0.0f;
     uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
     int32_t  n_zero    = 0; // zero slots per group
@@ -399,7 +576,7 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool direct_io) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -619,6 +796,10 @@ struct llama_moe_cache::impl {
         }
         ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
+        if (direct_io && !no_alloc) {
+            init_direct_io(model);
+        }
+
         for (size_t id = 0; id < devices.size(); ++id) {
             const device & d = devices[id];
             if (d.host_bytes == 0) {
@@ -634,6 +815,89 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+    }
+
+    // direct I/O: read the misses from the model file straight into the banks instead of copying them from the host experts
+    // with a memory-mapped model the host experts then stay untouched, so a model larger than the RAM can run
+    // needs banks in host memory that the device reads in place, and the position of the expert tensors in the model file
+    void init_direct_io(const llama_model & model) {
+#ifndef _WIN32
+        if (cpu_share > 0.0f) {
+            LLAMA_LOG_WARN("%s: MoE cache direct I/O is not used with misses on the CPU (they read the host experts)\n", __func__);
+            return;
+        }
+        for (device & d : devices) {
+            if (!d.buf) {
+                continue;
+            }
+            // Metal shared buffers are host memory wrapped without a copy, its private buffers are not
+            const char * reg  = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(d.backend)));
+            const std::string name = ggml_backend_buft_name(d.buft);
+            const bool metal_shared = strcmp(reg, "MTL") == 0 && name.find("_Private") == std::string::npos;
+            d.host_writable = ggml_backend_buft_is_host(d.buft) || metal_shared;
+        }
+
+        size_t n_layers = 0;
+        std::vector<int> fds;
+        for (group & g : groups) {
+            if (g.n_slots == 0 || !devices[g.id].host_writable) {
+                continue;
+            }
+            for (int32_t il : g.layers) {
+                layer & l = layers[il];
+                for (const ggml_tensor * w : l.experts) {
+                    int    fd   = -1;
+                    size_t offs = 0;
+                    if (!model.moe_expert_file(w, fd, offs)) {
+                        l.files.clear();
+                        break;
+                    }
+                    l.files.emplace_back(fd, offs);
+                    if (std::find(fds.begin(), fds.end(), fd) == fds.end()) {
+                        fds.push_back(fd);
+                    }
+                }
+                n_layers += l.files.empty() ? 0 : 1;
+            }
+        }
+        if (n_layers == 0) {
+            LLAMA_LOG_WARN("%s: MoE cache direct I/O is not available (it needs a cache in host-visible device memory and a model loaded from a file)\n", __func__);
+            return;
+        }
+
+#ifdef __APPLE__
+        // read around the file cache: the experts are kept in the MoE cache, a second copy in the page cache would take the RAM they are streamed to save
+        for (int fd : fds) {
+            fcntl(fd, F_NOCACHE, 1);
+            fcntl(fd, F_RDAHEAD, 0);
+        }
+#endif
+
+        int n_threads = 4;
+        if (const char * s = getenv("LLAMA_MOE_CACHE_IO_THREADS"); s != nullptr && atoi(s) > 0) {
+            n_threads = std::min(atoi(s), 64);
+        }
+        reader = std::make_unique<moe_cache_reader>(n_threads);
+        LLAMA_LOG_INFO("%s: MoE cache direct I/O: the misses of %zu layers are read from the model file, %d reads in flight\n", __func__, n_layers, n_threads);
+
+        // the reads land in the banks in place if the experts start and end on device blocks in the file and in the banks
+        size_t n_unaligned = 0;
+        for (const group & g : groups) {
+            for (int32_t il : g.layers) {
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.files.size(); ++ip) {
+                    n_unaligned += moe_cache_reader::is_aligned(l.files[ip].second, l.experts[ip]->nb[2], g.banks[ip]->data) ? 0 : 1;
+                }
+            }
+        }
+        if (n_unaligned > 0) {
+            LLAMA_LOG_WARN("%s: MoE cache direct I/O: %zu expert tensors are not aligned to %zu bytes in the model file, their experts are read through a buffer and copied "
+                    "(a file written with general.alignment = %zu is read in place)\n", __func__, n_unaligned, moe_cache_reader::block, moe_cache_reader::block);
+        }
+#else
+        GGML_UNUSED(model);
+        LLAMA_LOG_WARN("%s: MoE cache direct I/O is not supported on this platform\n", __func__);
+#endif
     }
 
     // the device that caches layer il
@@ -696,6 +960,13 @@ struct llama_moe_cache::impl {
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
         if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+            if (n_tokens > 0 && !l.files.empty() && !warned_large_batch) {
+                // such a batch reads the host experts: with a memory-mapped model larger than the RAM, that is paging from the disk
+                LLAMA_LOG_WARN("%s: a batch of %lld tokens does not read the MoE cache, its experts come from host memory, not from direct I/O; "
+                        "use a micro-batch (-ub) of at most %lld tokens to keep to the cache\n", __func__, (long long) n_tokens,
+                        (long long) std::min<int64_t>(max_batch, groups[l.ig].n_slots/n_expert_used));
+                warned_large_batch = true;
+            }
             return nullptr;
         }
         GGML_ASSERT(!cpu_part || l.slot_map_cpu != nullptr);
@@ -769,6 +1040,7 @@ struct llama_moe_cache::impl {
         if (it == layer_of.end()) {
             return false;
         }
+        const int64_t t_copy  = ggml_time_us();
         const int32_t il      = it->second.first;
         const bool    has_cpu = it->second.second;
         layer & l = layers[il];
@@ -804,6 +1076,7 @@ struct llama_moe_cache::impl {
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+        const int64_t t_synced = ggml_time_us();
 
         if (trace != nullptr) {
             write_trace(il, n_used);
@@ -832,7 +1105,16 @@ struct llama_moe_cache::impl {
             }
         }
 
+        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+        // direct I/O: read them from the model file into the banks, the backend is idle since the synchronize above
+        const bool direct = !l.files.empty();
+#ifndef _WIN32
+        if (direct) {
+            jobs.clear();
+        }
+#endif
         size_t bytes = 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
@@ -843,13 +1125,30 @@ struct llama_moe_cache::impl {
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+#ifndef _WIN32
+                if (direct) {
+                    jobs.push_back({ l.files[ip].first, l.files[ip].second + fills[i].expert*expert_size, (uint8_t *) bank->data + fills[i].slot*expert_size, n*expert_size });
+                } else
+#endif
+                {
+                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                }
                 bytes += n*expert_size;
                 i += n;
             }
         }
+#ifndef _WIN32
+        if (direct && !jobs.empty()) {
+            const int64_t t_start = ggml_time_us();
+            if (!reader->run(jobs)) {
+                GGML_ABORT("failed to read the experts of layer %d from the model file", il);
+            }
+            st.read_us    += ggml_time_us() - t_start;
+            st.read_bytes += bytes;
+            st.reads      += jobs.size();
+        }
+#endif
 
-        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
         st.misses += fills.size() + cpu.size();
         st.cpu    += cpu.size();
@@ -857,6 +1156,10 @@ struct llama_moe_cache::impl {
 
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, l.slot_map->data, 0, ggml_nbytes(l.slot_map));
+
+        st.sync_us += t_synced - t_copy;
+        st.copy_us += ggml_time_us() - t_copy;
+        st.lookups++;
 
         return true;
     }
@@ -869,6 +1172,12 @@ struct llama_moe_cache::impl {
             }
             LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu (%zu on the CPU), hit rate = %.2f%%, uploaded = %.2f MiB\n",
                 name, st.hits, st.misses, st.cpu, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("llama_moe_cache: %s: %zu lookups, %.1f ms in the copy callback, of which %.1f ms waiting for the device\n",
+                name, st.lookups, st.copy_us/1e3, st.sync_us/1e3);
+            if (st.reads > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: %s: read from the model file = %.2f MiB in %zu reads, %.1f ms waiting (%.2f GB/s)\n",
+                    name, st.read_bytes/1024.0/1024.0, st.reads, st.read_us/1e3, st.read_us > 0 ? st.read_bytes/1e3/st.read_us : 0.0);
+            }
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
@@ -878,8 +1187,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool direct_io) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share, direct_io)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

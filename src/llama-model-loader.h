@@ -115,6 +115,10 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
+    // MoE cache direct I/O: the expert tensors are read from the file by the cache, so they are left out of the mmap prefetch
+    bool moe_no_prefetch = false;
+    std::map<uint32_t, llama_mmap::ranges> moe_no_prefetch_ranges;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;

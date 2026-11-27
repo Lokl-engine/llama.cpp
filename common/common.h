@@ -620,6 +620,7 @@ struct common_params {
 
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
+    bool   moe_cache_direct_io = false; // read the MoE cache misses from the model file instead of copying them from host memory
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

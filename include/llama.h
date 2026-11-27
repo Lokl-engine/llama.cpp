@@ -341,6 +341,10 @@ extern "C" {
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
+        // do not prefetch the MoE expert tensors of a memory-mapped model: they are read from the file by the MoE cache
+        // (see llama_context_params::moe_cache_direct_io), so that a model larger than the RAM can be loaded [EXPERIMENTAL]
+        bool moe_no_prefetch;
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
@@ -412,6 +416,7 @@ extern "C" {
 
         size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
+        bool   moe_cache_direct_io; // read the MoE cache misses from the model file instead of copying them from host memory [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
