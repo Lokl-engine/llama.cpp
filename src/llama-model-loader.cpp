@@ -1439,6 +1439,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
 
+    // the MoE cache reads these from the file itself, prefetching them would pull the whole model into the page cache
+    if (moe_no_prefetch && !no_alloc &&
+            (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS || tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
+             tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS)) {
+        const auto & w = require_weight(tn.str().c_str());
+        moe_no_prefetch_ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(cur));
+    }
+
     ggml_tensor t_meta = *cur;
     if (flags & TENSOR_ALLOW_RESHAPE) {
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
@@ -1523,8 +1531,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
+            // not prefetched: the lazy tensors, and the experts that the MoE cache reads from the file
+            llama_mmap::ranges no_prefetch = lazy.for_file(idx);
+            if (const auto it = moe_no_prefetch_ranges.find(idx); it != moe_no_prefetch_ranges.end()) {
+                no_prefetch.insert(no_prefetch.end(), it->second.begin(), it->second.end());
+            }
+
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    no_prefetch);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

@@ -39,7 +39,12 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1421,7 +1426,6 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
 
     uint64_t n_elements = 0;
 
@@ -1433,6 +1437,25 @@ struct llama_model::impl {
 
     // model memory mapped files
     llama_mmaps mappings;
+
+    // position of each expert tensor in its model file, and a descriptor of that file kept open after the load,
+    // so that the MoE cache can read single experts from the file (see llama_model::moe_expert_file)
+    struct moe_file_pos {
+        int    fd;
+        size_t offs;
+    };
+    std::unordered_map<const ggml_tensor *, moe_file_pos> moe_file_pos_of;
+    std::vector<int> moe_fds;
+
+    ~impl() {
+#ifndef _WIN32
+        for (int fd : moe_fds) {
+            if (fd >= 0) {
+                close(fd);
+            }
+        }
+#endif
+    }
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -2329,8 +2352,40 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ggml_backend_tensor_get(per_layer_tok_embd_s, &per_layer_tok_embd_scale, 0, sizeof(per_layer_tok_embd_scale));
     }
 
+#ifndef _WIN32
+    // keep the position of the expert tensors in the model files, for the MoE cache to read single experts
+    if (!ml.no_alloc) {
+        pimpl->moe_fds.assign(ml.files.size(), -1);
+        for (const auto & layer : layers) {
+            for (const ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+                const auto * weight = t != nullptr ? ml.get_weight(ggml_get_name(t)) : nullptr;
+                if (weight == nullptr || weight->idx >= ml.files.size()) {
+                    continue;
+                }
+                int & fd = pimpl->moe_fds[weight->idx];
+                if (fd < 0) {
+                    fd = dup(ml.files[weight->idx]->file_id());
+                }
+                if (fd >= 0) {
+                    pimpl->moe_file_pos_of[t] = { fd, weight->offs };
+                }
+            }
+        }
+    }
+#endif
+
     load_tensors_hadamard();
 
+    return true;
+}
+
+bool llama_model::moe_expert_file(const ggml_tensor * t, int & fd, size_t & offs) const {
+    const auto it = pimpl->moe_file_pos_of.find(t);
+    if (it == pimpl->moe_file_pos_of.end()) {
+        return false;
+    }
+    fd   = it->second.fd;
+    offs = it->second.offs;
     return true;
 }
 
@@ -3755,6 +3810,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.moe_no_prefetch             =*/ false,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

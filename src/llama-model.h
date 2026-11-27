@@ -1064,6 +1064,10 @@ struct llama_model {
     llama_split_mode split_mode() const;
     bool no_alloc() const;
 
+    // the model file descriptor and the offset of the data of the expert tensor t in it, false if not known
+    // the descriptor stays open for the life of the model, for reading single experts (see llama_moe_cache)
+    bool moe_expert_file(const ggml_tensor * t, int & fd, size_t & offs) const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     // total number of parameters in the model
