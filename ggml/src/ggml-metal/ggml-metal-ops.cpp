@@ -3222,10 +3222,12 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
 // workgroups of the single-token decode kernel (kernel_flash_attn_ext_dec), at most
 #define OP_FLASH_ATTN_EXT_DEC_NWG_MAX 256
 
-// the single-token decode kernel is used for caches of at least this many rows. with a shorter cache the time
-// of an attention operation is the time to start its threadgroups, and the vec kernel is as fast or faster
+// the single-token decode kernel with one query head per threadgroup is used for caches of at least this many rows.
+// with a shorter cache the time of an attention operation is the time to start its threadgroups, and the vec kernel
+// is as fast or faster. see ggml_metal_op_flash_attn_ext_dec_nkv_min for several query heads per threadgroup
 // note: time the operations in a chain as in a model, not side by side: variants that do less work with fewer
-//       threads (f.ex. a single workgroup per head without the reduce pass) win side by side and lose in a chain
+//       threads (f.ex. a single workgroup per head without the reduce pass) win side by side and lose in a chain.
+//       time several tokens' worth of operations per measurement, a few short operations do not keep the GPU busy
 #define OP_FLASH_ATTN_EXT_DEC_NKV_MIN 4096
 
 // single-token decode over a quantized KV cache (kernel_flash_attn_ext_dec): true if the kernel is instantiated
@@ -3303,6 +3305,21 @@ static int32_t ggml_metal_op_flash_attn_ext_dec_group(const ggml_tensor * op) {
     }
 
     return 1;
+}
+
+// the single-token decode kernels are used for caches of at least this many rows
+// with several query heads per threadgroup the kernel dequantizes each row once for all of them and is ahead of the
+// vec kernel much earlier (Apple10, q4_1, chained: from 2048 rows with head sizes 128 and 256, and with a head size
+// of 512 at all the lengths that were timed, 256 rows and up)
+// ng is the number of query heads per threadgroup
+static int32_t ggml_metal_op_flash_attn_ext_dec_nkv_min(const ggml_tensor * op, int32_t ng) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (ng == 1) {
+        return OP_FLASH_ATTN_EXT_DEC_NKV_MIN;
+    }
+
+    return op->src[1]->ne[0] == 512 ? 256 : 2048;
 }
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/27390
@@ -4193,7 +4210,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
     } else if (!use_sparse && !has_rows && !has_bias && !use_kv_f16 && ne11 % OP_FLASH_ATTN_EXT_VEC_NCPSG == 0 &&
-               ne11 >= OP_FLASH_ATTN_EXT_DEC_NKV_MIN && ggml_metal_op_flash_attn_ext_use_dec(op)) {
+               ggml_metal_op_flash_attn_ext_use_dec(op) &&
+               ne11 >= ggml_metal_op_flash_attn_ext_dec_nkv_min(op, (!has_mask || ne32 == 1) ? ggml_metal_op_flash_attn_ext_dec_group(op) : 1)) {
         // single-token decode over a quantized KV cache
         const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache rows per block !! sync with the kernel !!
 
@@ -4210,13 +4228,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         };
 
         // each workgroup handles nsg*ncpsg cache rows at a time
-        // long caches use more workgroups, so that each simdgroup has only a few blocks of rows to process
+        // a simdgroup takes its blocks of rows one after the other, so the time of a short cache is set by the
+        // number of blocks per simdgroup: use more simdgroups, then more workgroups, to keep it at 1 or 2
+        // (Apple10, 24 query heads on 4 K/V heads of size 256, q4_1, against 4 blocks per simdgroup:
+        //  2048 rows -32%, 4096 rows -10%, 16384 rows -14%, 32768 rows -6%, 65536 rows unchanged)
         int64_t nsg = 1;
         int32_t nwg = 32;
-        while (2*nwg*nsg*ncpsg < ne11 && nsg < 4 && fa_dec_smem(2*nsg) <= props_dev->max_theadgroup_memory_size) {
+        while (nwg*nsg*ncpsg < ne11 && nsg < 4 && fa_dec_smem(2*nsg) <= props_dev->max_theadgroup_memory_size) {
             nsg *= 2;
         }
-        while (4*nwg*nsg*ncpsg < ne11 && nwg < OP_FLASH_ATTN_EXT_DEC_NWG_MAX) {
+        while (2*nwg*nsg*ncpsg <= ne11 && nwg < OP_FLASH_ATTN_EXT_DEC_NWG_MAX) {
             nwg *= 2;
         }
 

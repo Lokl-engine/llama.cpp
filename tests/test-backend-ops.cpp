@@ -13319,10 +13319,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // single-token decode over a quantized KV: covers the kernels that handle a single query row
     // (kv = 113 does not fill the last block of cache rows, long caches have a kernel of their own,
-    //  nr2 is the number of query heads per K/V head: the long caches handle 2, 3 or 4 of them per threadgroup)
+    //  nr2 is the number of query heads per K/V head: the long caches handle 2, 3 or 4 of them per threadgroup,
+    //  kv = 2336 is an odd number of blocks of cache rows)
     for (int hs : { 128, 256, 512, }) {
         for (int nr2 : { 1, 2, 3, 4, 6, 8, }) {
-            for (int kv : { 113, 512, 4096, 8192, }) {
+            for (int kv : { 113, 512, 2048, 2336, 4096, 8192, }) {
                 for (bool sinks : { false, true, }) {
                     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, }) {
                         test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {nr2, 1}, kv, 1, true, sinks, 0, 0, GGML_PREC_F32, type_KV, type_KV));
