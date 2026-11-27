@@ -236,8 +236,12 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             int n_fuse = 1;
             const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n_fuse);
             if (fusion) {
-                // fused kernels write to the last node of the group, not necessarily to the first node's dst
-                is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + n_fuse - 1));
+                // fused kernels write to the last node of the group, not necessarily to the first node's dst,
+                // and some also write the dst of a node in between (the top-k MoE kernel writes the expert ids),
+                // so every node of the group is checked against the ranges of the nodes that may still be running
+                for (int i = 1; i < n_fuse && is_concurrent; ++i) {
+                    is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + i));
+                }
             }
         }
 
