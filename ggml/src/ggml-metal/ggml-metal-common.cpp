@@ -157,6 +157,34 @@ bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op) {
     return ggml_metal_mul_mv_mma_type_supported(op->src[0]->type) && op->src[1]->type == GGML_TYPE_F32;
 }
 
+// !! sync with the choice of the kernel in ggml_metal_op_mul_mat !!
+// the fused kernel sums in the order of kernel_mul_mv_ext_f32_f32_r1_N, so it is only used for the numbers of vectors
+// that go to that kernel on every device: 2 to 5 (6 to 16 can go to the few-row MMA kernels) and 17 to 32
+bool ggml_metal_op_mul_mat_use_ext_affine(const struct ggml_tensor * op, int64_t n_vec) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    if (op->type != GGML_TYPE_F32 || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+
+    // a square matrix without batch dimensions
+    if (src0->ne[0] != src0->ne[1] || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src0->ne[0] % 128 != 0 || src0->ne[0] > 512 || !ggml_is_contiguous(src0)) {
+        return false;
+    }
+
+    if (n_vec < 0) {
+        return true;
+    }
+
+    return (n_vec >= 2 && n_vec <= 5) || (n_vec > 16 && n_vec <= 32);
+}
+
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
 // the type indicates whether it is a source range (i.e. ops read data from it) or a destination range (i.e. ops write data to it)
 struct ggml_mem_range {

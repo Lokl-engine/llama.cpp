@@ -214,6 +214,7 @@ constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
 constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
 constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
+constant short FC_mul_mv_aff   [[function_constant(FC_MUL_MV + 6)]];
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -700,6 +701,138 @@ void kernel_mul_mv_ext_q4_f32_impl(
         }
     }
 }
+
+// kernel_mul_mv_ext_q4_f32_impl for a dense F32 matrix times a few F32 vectors without batch dimensions, with the
+// elementwise operations around the product fused into it. FC_mul_mv_aff:
+//   1: dst = src0 * (src1 * s)
+//   2: dst = src0 * ((src1 - mu) * s)
+//   3: dst = (src0 * src1) * s + mu
+// s and mu have the layout of the vectors. the operations and the order of the summations are those of the separate
+// SUB / MUL / MUL_MAT / ADD kernels, only the dispatches in between are saved (they cost more than the arithmetic
+// when a small matrix is applied to the heads of one token)
+template<short r1ptg>
+kernel void kernel_mul_mv_ext_f32_f32_aff(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * aff_s,
+        device const char * aff_mu,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG   = FC_mul_mv_nsg;
+    const short nxpsg = FC_mul_mv_nxpsg;
+
+    const short chpt = 4; // chunks per thread
+
+    const short nypsg = (32/nxpsg);
+
+    const short tx = tiisg%nxpsg;
+    const short ty = tiisg/nxpsg;
+
+    const int i01 = tgpig.x*(nypsg*NSG) + nypsg*sgitg + ty;
+    const int i11 = tgpig.y*r1ptg;
+
+    const uint64_t offset0 = i01*args.nb01;
+    const uint64_t offset1 = i11*args.nb11;
+
+    device const float4 * x4 = (i01 < args.ne01) ? (device const float4 *) (src0 + offset0) + tx : (device const float4 *) src0;
+
+    device const float4 * y4[r1ptg];
+    device const float4 * s4[r1ptg];
+    device const float4 * m4[r1ptg];
+
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        const bool ok = i11 + ir1 < args.ne11;
+
+        y4[ir1] = ok ? (device const float4 *) (src1   + offset1 + ir1*args.nb11) + tx : (device const float4 *) src1;
+        s4[ir1] = ok ? (device const float4 *) (aff_s  + offset1 + ir1*args.nb11) + tx : (device const float4 *) aff_s;
+        m4[ir1] = ok ? (device const float4 *) (aff_mu + offset1 + ir1*args.nb11) + tx : (device const float4 *) aff_mu;
+    }
+
+    float sumf[r1ptg] = { [ 0 ... r1ptg - 1 ] = 0.0f };
+
+    for (int ich = tx; 4*ich < args.ne00; ich += chpt*nxpsg) {
+        float4 lx[chpt];
+
+#pragma unroll(chpt)
+        for (short ch = 0; ch < chpt; ++ch) {
+            lx[ch] = x4[ch*nxpsg];
+        }
+
+#pragma unroll(chpt)
+        for (short ch = 0; ch < chpt; ++ch) {
+#pragma unroll(r1ptg)
+            for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+                float4 ly = y4[ir1][ch*nxpsg];
+
+                if (FC_mul_mv_aff == 2) {
+                    ly = ly - m4[ir1][ch*nxpsg];
+                }
+                if (FC_mul_mv_aff == 1 || FC_mul_mv_aff == 2) {
+                    ly = ly*s4[ir1][ch*nxpsg];
+                }
+
+                sumf[ir1] += dot(lx[ch], ly);
+            }
+        }
+
+        x4 += chpt*nxpsg;
+
+#pragma unroll(r1ptg)
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+            y4[ir1] += chpt*nxpsg;
+            s4[ir1] += chpt*nxpsg;
+            m4[ir1] += chpt*nxpsg;
+        }
+    }
+
+    // reduce only the threads in each row
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+        if (nxpsg >= 32) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
+        }
+        if (nxpsg >= 16) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  8);
+        }
+        if (nxpsg >= 8) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  4);
+        }
+        if (nxpsg >= 4) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  2);
+        }
+        if (nxpsg >= 2) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  1);
+        }
+    }
+
+    if (tx == 0) {
+        for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.ne11; ++ir1) {
+            if (i01 < args.ne01) {
+                const uint64_t o = (uint64_t)(i11 + ir1)*args.ne0 + i01;
+
+                float res = sumf[ir1];
+
+                if (FC_mul_mv_aff == 3) {
+                    // two rounded operations, as the separate MUL and ADD kernels: no fused multiply-add
+#pragma clang fp contract(off)
+                    res = res*((device const float *) aff_s)[o];
+                    res = res + ((device const float *) aff_mu)[o];
+                }
+
+                ((device float *) dst)[o] = res;
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_ext_f32_f32_aff<2>) mul_mv_ext_f32_f32_aff_t;
+
+template [[host_name("kernel_mul_mv_ext_f32_f32_aff_r1_2")]] kernel mul_mv_ext_f32_f32_aff_t kernel_mul_mv_ext_f32_f32_aff<2>;
+template [[host_name("kernel_mul_mv_ext_f32_f32_aff_r1_3")]] kernel mul_mv_ext_f32_f32_aff_t kernel_mul_mv_ext_f32_f32_aff<3>;
+template [[host_name("kernel_mul_mv_ext_f32_f32_aff_r1_4")]] kernel mul_mv_ext_f32_f32_aff_t kernel_mul_mv_ext_f32_f32_aff<4>;
+template [[host_name("kernel_mul_mv_ext_f32_f32_aff_r1_5")]] kernel mul_mv_ext_f32_f32_aff_t kernel_mul_mv_ext_f32_f32_aff<5>;
 
 // mat-vec kernel processing in chunks of float4x4
 template<short r1ptg, typename q_t, short chpb, void (*deq_t4x4)(device const q_t *, short, thread float4x4 &) >
