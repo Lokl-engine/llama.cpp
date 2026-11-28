@@ -843,31 +843,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
-// the few-vector kernel for a dense F32 matrix with the elementwise operations around the product fused into it
-// aff: 1 - scaled vectors, 2 - shifted and scaled vectors, 3 - scaled and shifted result
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext_aff(ggml_metal_library_t lib, int nsg, int nxpsg, int r1ptg, int aff) {
-    char base[256];
-    char name[256];
-
-    snprintf(base, 256, "kernel_mul_mv_ext_f32_f32_aff_r1_%d", r1ptg);
-    snprintf(name, 256, "%s_nsg=%d_nxpsg=%d_aff=%d", base, nsg, nxpsg, aff);
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        ggml_metal_cv_t cv = ggml_metal_cv_init();
-
-        ggml_metal_cv_set_int16(cv, nsg,   FC_MUL_MV + 0);
-        ggml_metal_cv_set_int16(cv, nxpsg, FC_MUL_MV + 1);
-        ggml_metal_cv_set_int16(cv, aff,   FC_MUL_MV + 6);
-
-        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
-
-        ggml_metal_cv_free(cv);
-    }
-
-    return res;
-}
-
 // threadgroups needed to fill the GPU
 // TODO: dedup
 static constexpr int64_t GGML_METAL_MIN_THREADGROUPS = 128;

@@ -2662,103 +2662,6 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
-// a small dense F32 matrix times a few vectors with the elementwise operations around it, in a single dispatch:
-//   [SUB +] MUL + MUL_MAT (post == false) or MUL_MAT + MUL + ADD (post == true), n_fuse nodes from idx on
-// the fusion table has checked the shapes (ggml_metal_fusion_check_mul_mat_affine)
-static int ggml_metal_op_mul_mat_affine(ggml_metal_op_t ctx, int idx, int n_fuse, bool post) {
-    ggml_metal_library_t lib = ctx->lib;
-    ggml_metal_encoder_t enc = ctx->enc;
-
-    const ggml_tensor * mm  = post ? ctx->node(idx) : ctx->node(idx + n_fuse - 1);
-    const ggml_tensor * dst = ctx->node(idx + n_fuse - 1);
-
-    const ggml_tensor * x;  // the vectors
-    const ggml_tensor * s;  // the scale
-    const ggml_tensor * mu; // the shift
-
-    int aff;
-
-    if (post) {
-        GGML_ASSERT(n_fuse == 3);
-
-        x   = mm->src[1];
-        s   = ctx->node(idx + 1)->src[1];
-        mu  = ctx->node(idx + 2)->src[1];
-        aff = 3;
-    } else {
-        GGML_ASSERT(n_fuse == 2 || n_fuse == 3);
-
-        const ggml_tensor * first = ctx->node(idx);
-
-        x   = first->src[0];
-        s   = ctx->node(idx + n_fuse - 2)->src[1];
-        mu  = n_fuse == 3 ? first->src[1] : s;
-        aff = n_fuse == 3 ? 2 : 1;
-    }
-
-    const int32_t ne00 = mm->src[0]->ne[0];
-    const int32_t ne01 = mm->src[0]->ne[1];
-    const int32_t ne11 = s->ne[1];
-
-    GGML_ASSERT(ggml_metal_op_mul_mat_use_ext_affine(mm, ne11));
-
-    // !! sync with the few-vector branch of ggml_metal_op_mul_mat: the same threads sum in the same order !!
-    const int nsg = 2;
-
-    int16_t nxpsg = 0;
-    if (ne00 % 256 == 0 && ne11 < 3) {
-        nxpsg = 16;
-    } else {
-        nxpsg = 8;
-    }
-
-    const int16_t nypsg = 32/nxpsg;
-    const int16_t r0ptg = nypsg*nsg;
-          int16_t r1ptg = 4;
-
-    switch (ne11) {
-        case 2:  r1ptg = 2; break;
-        case 3:  r1ptg = 3; break;
-        case 5:  r1ptg = 5; break;
-        default: r1ptg = 4; break;
-    };
-
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext_aff(lib, nsg, nxpsg, r1ptg, aff);
-
-    ggml_metal_kargs_mul_mv_ext args = {
-        /*.ne00  =*/ ne00,
-        /*.ne01  =*/ ne01,
-        /*.ne02  =*/ 1,
-        /*.nb00  =*/ mm->src[0]->nb[0],
-        /*.nb01  =*/ mm->src[0]->nb[1],
-        /*.nb02  =*/ mm->src[0]->nb[2],
-        /*.nb03  =*/ mm->src[0]->nb[3],
-        /*.ne10  =*/ ne00,
-        /*.ne11  =*/ ne11,
-        /*.ne12  =*/ 1,
-        /*.nb10  =*/ sizeof(float),
-        /*.nb11  =*/ ne00*sizeof(float),
-        /*.nb12  =*/ ne00*ne11*sizeof(float),
-        /*.nb13  =*/ ne00*ne11*sizeof(float),
-        /*.ne0   =*/ ne01,
-        /*.ne1   =*/ ne11,
-        /*.r2    =*/ 1,
-        /*.r3    =*/ 1,
-    };
-
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),          2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        3);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(s),          4);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mu),         5);
-
-    ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + r0ptg - 1)/r0ptg, (ne11 + r1ptg - 1)/r1ptg, 1, 32, nsg, 1);
-
-    return n_fuse;
-}
-
 // the generic mat-vec kernel, or its 2-row Q4_0 variant if nc
 static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
@@ -2832,14 +2735,6 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_t enc = ctx->enc;
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
-
-    // a small dense matrix times a few vectors, scaled and shifted
-    {
-        const int n_fuse = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_MUL_MAT_AFFINE);
-        if (n_fuse > 1) {
-            return ggml_metal_op_mul_mat_affine(ctx, idx, n_fuse, true);
-        }
-    }
 
     if (ggml_metal_op_mul_mat_use_fwht(op, props_dev->max_theadgroup_memory_size)) {
         return ggml_metal_op_fwht(ctx, idx);
@@ -4703,12 +4598,6 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_MOE_REDUCE) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_moe_reduce(ctx, idx);
-        }
-
-        // a few shifted and scaled vectors times a small dense matrix
-        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_AFFINE_MUL_MAT) {
-            ctx->count_fusions(fusion);
-            return ggml_metal_op_mul_mat_affine(ctx, idx, n_fuse, false);
         }
     }
 

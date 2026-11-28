@@ -43,8 +43,6 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
-    GGML_METAL_FUSION_AFFINE_MUL_MAT, // [SUB +] MUL + MUL_MAT (small dense matrix times a few scaled vectors)
-    GGML_METAL_FUSION_MUL_MAT_AFFINE, // MUL_MAT + MUL + ADD   (small dense matrix times a few vectors, scaled and shifted)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

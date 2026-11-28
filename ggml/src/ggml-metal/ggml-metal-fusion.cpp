@@ -811,114 +811,6 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
-// [SUB +] MUL + MUL_MAT and MUL_MAT + MUL + ADD around a small dense F32 matrix times a few vectors, f.ex. a learned
-// transform of the heads of one token: k' = R ((k - mu) * s), q' = R (q * s), o = (R o') * s + mu
-// the scale and the shift have the shape of the vectors. a RESHAPE to or from 2 dims may sit next to the MUL_MAT
-// the raw nodes are validated here (unsafe pattern): the generic chain check does not look through the RESHAPE
-static bool ggml_metal_fusion_check_mul_mat_affine(
-        const ggml_metal_fusion       * fusion,
-        const ggml_tensor * const     * nodes,
-        const ggml_cgraph             * gf,
-        const int                     * node_idxs,
-              int                       idx,
-              ggml_metal_fusion_mode    mode) {
-    const std::vector<ggml_op> & ops_all = fusion->ops_all;
-
-    const int n_ops     = (int) fusion->ops.size();
-    const int raw_start = node_idxs[idx];
-    const int raw_end   = node_idxs[idx + n_ops - 1];
-    const int raw_count = raw_end - raw_start + 1;
-
-    if (raw_count != (int) ops_all.size() || raw_count > GGML_METAL_FUSION_MAX) {
-        return false;
-    }
-
-    int raw_idxs[GGML_METAL_FUSION_MAX];
-    for (int i = 0; i < raw_count; ++i) {
-        raw_idxs[i] = raw_start + i;
-        if (gf->nodes[raw_start + i]->op != ops_all[i]) {
-            return false;
-        }
-    }
-
-    // the intermediate nodes are read only inside the pattern and are not graph outputs
-    const int outputs[1] = { raw_end };
-    if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, ops_all.data(), outputs, 1)) {
-        return false;
-    }
-
-    const bool post = fusion->id == GGML_METAL_FUSION_MUL_MAT_AFFINE;
-
-    const ggml_tensor * mm = post ? nodes[0] : nodes[n_ops - 1];
-
-    // the vectors, the scale and the shift (the shift is absent for MUL + MUL_MAT)
-    const ggml_tensor * x;
-    const ggml_tensor * s;
-    const ggml_tensor * mu = nullptr;
-
-    if (post) {
-        const ggml_tensor * mul = nodes[1];
-        const ggml_tensor * add = nodes[2];
-
-        // MUL_MAT [-> RESHAPE] -> MUL -> ADD
-        const ggml_tensor * y = gf->nodes[raw_start + 1]->op == GGML_OP_RESHAPE ? gf->nodes[raw_start + 1] : mm;
-        if ((y != mm && y->src[0] != mm) || mul->src[0] != y || add->src[0] != mul) {
-            return false;
-        }
-
-        x  = mm->src[1];
-        s  = mul->src[1];
-        mu = add->src[1];
-
-        if (mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add)) {
-            return false;
-        }
-    } else {
-        const ggml_tensor * mul = nodes[n_ops - 2];
-        const ggml_tensor * sub = n_ops == 3 ? nodes[0] : nullptr;
-
-        // [SUB ->] MUL [-> RESHAPE] -> MUL_MAT
-        const ggml_tensor * y = gf->nodes[raw_end - 1]->op == GGML_OP_RESHAPE ? gf->nodes[raw_end - 1] : mul;
-        if ((y != mul && y->src[0] != mul) || mm->src[1] != y || (sub && mul->src[0] != sub)) {
-            return false;
-        }
-
-        x  = sub ? sub->src[0] : mul->src[0];
-        s  = mul->src[1];
-        mu = sub ? sub->src[1] : nullptr;
-
-        if (mul->type != GGML_TYPE_F32 || (sub && sub->type != GGML_TYPE_F32) || !ggml_is_contiguous(mm)) {
-            return false;
-        }
-    }
-
-    const int64_t d = mm->src[0]->ne[0];
-
-    // the scale and the shift: one F32 value per element of the vectors of one token
-    auto param_ok = [&](const ggml_tensor * t) {
-        return t == nullptr || (t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
-                                t->ne[0] == d && t->ne[2] == 1 && t->ne[3] == 1);
-    };
-
-    if (x->type != GGML_TYPE_F32 || x->ne[0] != d || !param_ok(s) || !param_ok(mu) || (mu && mu->ne[1] != s->ne[1])) {
-        return false;
-    }
-
-    // the number of vectors per token is a property of the graph; the number of tokens is not, so that the graph
-    // optimizer packs the nodes in the same way for all batch sizes
-    if (!ggml_metal_op_mul_mat_use_ext_affine(mm, s->ne[1])) {
-        return false;
-    }
-
-    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
-        return true;
-    }
-
-    // a single token: the vectors are exactly as many as the scales
-    return ggml_is_contiguous(x) && ggml_nelements(x) == d*s->ne[1] && ggml_nelements(mm) == d*s->ne[1] &&
-        mm->src[1]->ne[0] == d && mm->src[1]->ne[1] == s->ne[1] && ggml_is_contiguous(mm->src[1]);
-}
-
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -970,13 +862,6 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
-static const std::vector<ggml_op> ops_sub_mul_mul_mat   = { GGML_OP_SUB, GGML_OP_MUL, GGML_OP_MUL_MAT };
-static const std::vector<ggml_op> ops_sub_mul_r_mul_mat = { GGML_OP_SUB, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
-static const std::vector<ggml_op> ops_mul_mul_mat       = { GGML_OP_MUL, GGML_OP_MUL_MAT };
-static const std::vector<ggml_op> ops_mul_r_mul_mat     = { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
-static const std::vector<ggml_op> ops_mul_mat_mul_add   = { GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_ADD };
-static const std::vector<ggml_op> ops_mul_mat_r_mul_add = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_ADD };
-
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,     ops_norm_mul,         {}, false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD, ops_norm_mul_add,     {}, false, ggml_metal_fusion_check_norm },
@@ -1026,13 +911,6 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SSM_CONV_SILU, ops_ssm_conv_silu, {}, false, ggml_metal_fusion_check_ssm_conv_silu },
 
     { GGML_METAL_FUSION_MUL_MAT_ADD, ops_mul_mat_add, {}, false, ggml_metal_fusion_check_mul_mat_add },
-
-    { GGML_METAL_FUSION_AFFINE_MUL_MAT, ops_sub_mul_mul_mat,   {}, true, ggml_metal_fusion_check_mul_mat_affine },
-    { GGML_METAL_FUSION_AFFINE_MUL_MAT, ops_sub_mul_r_mul_mat, {}, true, ggml_metal_fusion_check_mul_mat_affine },
-    { GGML_METAL_FUSION_AFFINE_MUL_MAT, ops_mul_mul_mat,       {}, true, ggml_metal_fusion_check_mul_mat_affine },
-    { GGML_METAL_FUSION_AFFINE_MUL_MAT, ops_mul_r_mul_mat,     {}, true, ggml_metal_fusion_check_mul_mat_affine },
-    { GGML_METAL_FUSION_MUL_MAT_AFFINE, ops_mul_mat_mul_add,   {}, true, ggml_metal_fusion_check_mul_mat_affine },
-    { GGML_METAL_FUSION_MUL_MAT_AFFINE, ops_mul_mat_r_mul_add, {}, true, ggml_metal_fusion_check_mul_mat_affine },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -1087,15 +965,6 @@ void ggml_metal_fusion_add_alloc_deps(
                 continue;
             }
             if (ggml_metal_fusion_match_raw_pattern(gf, i, fusion.ops_all)) {
-                // MUL next to MUL_MAT is a frequent sequence: only the small dense matrices that the pattern can
-                // fuse take part here, so that the pattern does not hide a longer-lived one that starts inside it
-                if (fusion.id == GGML_METAL_FUSION_AFFINE_MUL_MAT || fusion.id == GGML_METAL_FUSION_MUL_MAT_AFFINE) {
-                    const int i_mm = fusion.id == GGML_METAL_FUSION_MUL_MAT_AFFINE ? i : i + (int) fusion.ops_all.size() - 1;
-                    if (!ggml_metal_op_mul_mat_use_ext_affine(gf->nodes[i_mm], -1)) {
-                        continue;
-                    }
-                }
-
                 best = &fusion;
                 best_raw = (int) fusion.ops_all.size();
             }

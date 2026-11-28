@@ -8270,83 +8270,6 @@ static std::string var_to_str(mul_mat_add_mode mode) {
     return "unknown";
 }
 
-enum mul_mat_affine_mode {
-    MUL_MAT_AFFINE_SCALE_IN,       // R (x * s)
-    MUL_MAT_AFFINE_SHIFT_SCALE_IN, // R ((x - mu) * s)
-    MUL_MAT_AFFINE_OUT,            // (R x) * s + mu
-    MUL_MAT_AFFINE_IN_TWICE,       // R ((x - mu) * s) + ((x - mu) * s): the scaled vectors are read twice, no fusion
-};
-
-static std::string var_to_str(mul_mat_affine_mode mode) {
-    switch (mode) {
-        case MUL_MAT_AFFINE_SCALE_IN:       return "R(x*s)";
-        case MUL_MAT_AFFINE_SHIFT_SCALE_IN: return "R((x-mu)*s)";
-        case MUL_MAT_AFFINE_OUT:            return "(Rx)*s+mu";
-        case MUL_MAT_AFFINE_IN_TWICE:       return "R(y)+y";
-    }
-    return "unknown";
-}
-
-// a small dense matrix times the n heads of n_tokens tokens with a scale and a shift per head element around the
-// product (f.ex. a learned transform of the keys, queries and values of a KV cache), which backends may fuse into
-// the mat-mul. reshape: the vectors are [d, n, n_tokens] and the mat-mul reads them as [d, n*n_tokens]
-struct test_mul_mat_affine : public test_case {
-    const int64_t d;
-    const int64_t n;
-    const int64_t n_tokens;
-    const mul_mat_affine_mode mode;
-    const bool reshape;
-
-    test_mul_mat_affine(int64_t d, int64_t n, int64_t n_tokens, mul_mat_affine_mode mode, bool reshape)
-        : d(d), n(n), n_tokens(n_tokens), mode(mode), reshape(reshape) {}
-
-    std::string vars() override {
-        return VARS_TO_STR5(d, n, n_tokens, mode, reshape);
-    }
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "MUL_MAT_AFFINE";
-    }
-
-    bool run_whole_graph() override { return true; }
-
-    double max_nmse_err() override {
-        return 5e-6;
-    }
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * r  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, d);
-        ggml_tensor * x  = reshape ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n, n_tokens) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n*n_tokens);
-        ggml_tensor * s  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, reshape ? n : n*n_tokens);
-        ggml_tensor * mu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, reshape ? n : n*n_tokens);
-
-        auto as_2d = [&](ggml_tensor * t) { return reshape ? ggml_reshape_2d(ctx, t, d, n*n_tokens) : t; };
-        auto as_3d = [&](ggml_tensor * t) { return reshape ? ggml_reshape_3d(ctx, t, d, n, n_tokens) : t; };
-
-        ggml_tensor * out = nullptr;
-        switch (mode) {
-            case MUL_MAT_AFFINE_SCALE_IN:
-                out = as_3d(ggml_mul_mat(ctx, r, as_2d(ggml_mul(ctx, x, s))));
-                break;
-            case MUL_MAT_AFFINE_SHIFT_SCALE_IN:
-                out = as_3d(ggml_mul_mat(ctx, r, as_2d(ggml_mul(ctx, ggml_sub(ctx, x, mu), s))));
-                break;
-            case MUL_MAT_AFFINE_OUT:
-                out = ggml_add(ctx, ggml_mul(ctx, as_3d(ggml_mul_mat(ctx, r, as_2d(x))), s), mu);
-                break;
-            case MUL_MAT_AFFINE_IN_TWICE:
-                {
-                    ggml_tensor * y = ggml_mul(ctx, ggml_sub(ctx, x, mu), s);
-                    out = ggml_add(ctx, as_3d(ggml_mul_mat(ctx, r, as_2d(y))), y);
-                } break;
-        }
-        ggml_set_name(out, "out");
-
-        return out;
-    }
-};
-
 // mul_mat followed by an add of a residual, which backends may fuse into the mat-mul
 struct test_mul_mat_add : public test_case {
     const ggml_type type_a;
@@ -12335,25 +12258,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
-
-    // a small dense matrix times a few heads with a scale and a shift around it: the numbers of vectors that are
-    // fused (2 to 5, 17 to 32), that are not (1, 6, 16, 33), several tokens (not fused), with and without the
-    // reshapes that a model puts next to the mat-mul
-    for (mul_mat_affine_mode mode : { MUL_MAT_AFFINE_SCALE_IN, MUL_MAT_AFFINE_SHIFT_SCALE_IN, MUL_MAT_AFFINE_OUT, MUL_MAT_AFFINE_IN_TWICE }) {
-        for (bool reshape : { false, true }) {
-            for (int64_t d : { 128, 256, 512 }) {
-                for (int64_t n : { 1, 2, 3, 4, 5, 6, 16, 17, 24, 32, 33 }) {
-                    test_cases.emplace_back(new test_mul_mat_affine(d, n, 1, mode, reshape));
-                }
-                test_cases.emplace_back(new test_mul_mat_affine(d, 4,  3, mode, reshape));
-                test_cases.emplace_back(new test_mul_mat_affine(d, 24, 2, mode, reshape));
-            }
-            // not a small square matrix of the supported sizes
-            test_cases.emplace_back(new test_mul_mat_affine(64,   4, 1, mode, reshape));
-            test_cases.emplace_back(new test_mul_mat_affine(1024, 4, 1, mode, reshape));
-        }
-    }
-
 
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {
